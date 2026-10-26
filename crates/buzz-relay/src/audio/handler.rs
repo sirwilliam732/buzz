@@ -15973,6 +15973,7 @@ mod tests {
                     &admin.public_key().to_hex(),
                     "admin",
                     None,
+                    &nostr::Keys::generate(),
                 )
                 .await
                 .expect("seed relay administrator");
