@@ -15,6 +15,8 @@ class Channel {
   /// NIP-CL labels from metadata; presentation hints, never access grants.
   final List<String> labels;
   final String channelType; // "stream", "forum", "dm"
+  /// Admission default; changing it never changes an existing person's role.
+  final String joinRole;
   final String visibility; // "open", "private"
   final String description;
   final String? topic;
@@ -27,6 +29,9 @@ class Channel {
   final List<String> participants;
   final List<String> participantPubkeys;
   final bool isMember;
+
+  /// Role retained from the membership snapshot. Null means unconfirmed.
+  final String? viewerRole;
   final int? ttlSeconds;
   final DateTime? ttlDeadline;
 
@@ -36,6 +41,7 @@ class Channel {
     required this.channelType,
     this.labels = const [],
     required this.visibility,
+    this.joinRole = 'member',
     required this.description,
     required this.createdBy,
     required this.createdAt,
@@ -47,6 +53,7 @@ class Channel {
     this.participants = const [],
     this.participantPubkeys = const [],
     this.isMember = false,
+    this.viewerRole = 'member',
     this.ttlSeconds,
     this.ttlDeadline,
   });
@@ -57,6 +64,9 @@ class Channel {
     channelType: json['channel_type'] as String,
     labels: (json['labels'] as List<dynamic>? ?? const []).cast<String>(),
     visibility: json['visibility'] as String,
+    joinRole: json['join_role'] == null || json['join_role'] == 'member'
+        ? 'member'
+        : 'guest',
     description: (json['description'] as String?) ?? '',
     topic: json['topic'] as String?,
     purpose: json['purpose'] as String?,
@@ -75,6 +85,7 @@ class Channel {
         (json['participant_pubkeys'] as List<dynamic>? ?? const [])
             .cast<String>(),
     isMember: json['is_member'] as bool? ?? false,
+    viewerRole: json['viewer_role'] as String?,
     ttlSeconds: json['ttl_seconds'] as int?,
     ttlDeadline: json['ttl_deadline'] != null
         ? DateTime.parse(json['ttl_deadline'] as String)
@@ -88,6 +99,7 @@ class Channel {
     'channel_type': channelType,
     'labels': labels,
     'visibility': visibility,
+    'join_role': joinRole,
     'description': description,
     'topic': topic,
     'purpose': purpose,
@@ -99,6 +111,7 @@ class Channel {
     'participants': participants,
     'participant_pubkeys': participantPubkeys,
     'is_member': isMember,
+    'viewer_role': viewerRole,
     'ttl_seconds': ttlSeconds,
     'ttl_deadline': ttlDeadline?.toIso8601String(),
   };
@@ -123,18 +136,31 @@ class Channel {
   bool get mentionsOutsidePeople => isStream || isForum || isDm;
   bool get isDm => channelType == 'dm';
   bool get isPrivate => visibility == 'private';
-  bool get canJoin => visibility == 'open' && !isArchived && !isMember && !isDm;
+  bool get canJoin =>
+      visibility == 'open' &&
+      joinRole == 'member' &&
+      !isSolo &&
+      !isArchived &&
+      !isMember &&
+      !isDm;
 
   /// Whether [selfRole] may add *another* identity here, mirroring the relay's
-  /// kind:9000 authority (`validate_admin_event` + `add_member`): DMs never,
-  /// open channels always, private channels for any active member. Elevated
+  /// kind:9000 authority: DMs and Guests never; contributors may invite.
+  /// An ordinary open Member-default preview may also invite. Elevated
   /// grants remain reserved for owners/admins. Unknown visibility fails closed.
   bool canAddMembers(String? selfRole) {
-    if (isDm) return false;
-    if (visibility == 'open') return true;
+    if (isDm || isArchived || selfRole == 'guest') return false;
+    if (selfRole != null && !channelRoleCanContribute(selfRole)) return false;
+    if (visibility == 'open') {
+      return selfRole != null || (joinRole == 'member' && !isSolo);
+    }
     if (visibility == 'private') return selfRole != null;
     return false;
   }
+
+  /// Membership and ordinary contribution are deliberately separate.
+  bool get canContribute =>
+      isMember && !isArchived && channelRoleCanContribute(viewerRole);
 
   bool get isArchived => archivedAt != null;
 
@@ -168,6 +194,7 @@ class Channel {
     channelType: details.channelType,
     labels: details.labels,
     visibility: details.visibility,
+    joinRole: details.joinRole,
     description: details.description,
     topic: details.topic,
     purpose: details.purpose,
@@ -179,6 +206,7 @@ class Channel {
     participants: participants,
     participantPubkeys: participantPubkeys,
     isMember: isMember,
+    viewerRole: viewerRole,
     ttlSeconds: details.ttlSeconds,
     ttlDeadline: details.ttlDeadline,
   );
@@ -196,6 +224,7 @@ class Channel {
     channelType: channelType,
     labels: labels,
     visibility: visibility,
+    joinRole: joinRole,
     description: description ?? this.description,
     topic: topic,
     purpose: purpose,
@@ -211,6 +240,7 @@ class Channel {
     participants: participants,
     participantPubkeys: participantPubkeys,
     isMember: isMember ?? this.isMember,
+    viewerRole: viewerRole,
     ttlSeconds: ttlSeconds,
     ttlDeadline: ttlDeadline,
   );
@@ -224,6 +254,9 @@ class ChannelDetails {
   /// NIP-CL labels from metadata; presentation hints, never access grants.
   final List<String> labels;
   final String channelType;
+
+  /// Admission default; changing it never changes an existing person's role.
+  final String joinRole;
   final String visibility;
   final String description;
   final String? topic;
@@ -241,6 +274,7 @@ class ChannelDetails {
     required this.channelType,
     this.labels = const [],
     required this.visibility,
+    this.joinRole = 'member',
     required this.description,
     required this.createdBy,
     required this.createdAt,
@@ -258,6 +292,9 @@ class ChannelDetails {
     channelType: json['channel_type'] as String,
     labels: (json['labels'] as List<dynamic>? ?? const []).cast<String>(),
     visibility: json['visibility'] as String,
+    joinRole: json['join_role'] == null || json['join_role'] == 'member'
+        ? 'member'
+        : 'guest',
     description: (json['description'] as String?) ?? '',
     topic: json['topic'] as String?,
     purpose: json['purpose'] as String?,
@@ -279,6 +316,7 @@ class ChannelDetails {
     channelType: channel.channelType,
     labels: channel.labels,
     visibility: channel.visibility,
+    joinRole: channel.joinRole,
     description: channel.description,
     topic: channel.topic,
     purpose: channel.purpose,
@@ -290,3 +328,7 @@ class ChannelDetails {
     ttlDeadline: channel.ttlDeadline,
   );
 }
+
+/// Known signed roster roles that permit ordinary content publication.
+bool channelRoleCanContribute(String? role) =>
+    const {'owner', 'admin', 'member', 'bot'}.contains(role);

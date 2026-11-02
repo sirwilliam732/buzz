@@ -25,6 +25,7 @@ Future<bool?> showAddChannelMembersSheet({
   required BuildContext context,
   required String channelId,
   required Set<String> existingPubkeys,
+  String humanRole = 'member',
 }) async {
   if (!kIsWeb && defaultTargetPlatform == TargetPlatform.iOS) {
     if (_nativePickerOpen) return null;
@@ -37,6 +38,7 @@ Future<bool?> showAddChannelMembersSheet({
         pageBuilder: (_, _, _) => AddChannelMembersSheet(
           channelId: channelId,
           existingPubkeys: existingPubkeys,
+          humanRole: humanRole,
           nativePresentation: true,
         ),
       );
@@ -57,6 +59,7 @@ Future<bool?> showAddChannelMembersSheet({
     builder: (_) => AddChannelMembersSheet(
       channelId: channelId,
       existingPubkeys: existingPubkeys,
+      humanRole: humanRole,
     ),
   );
 }
@@ -68,11 +71,13 @@ class AddChannelMembersSheet extends HookConsumerWidget {
     required this.channelId,
     required this.existingPubkeys,
     this.nativePresentation = false,
+    this.humanRole = 'member',
   });
 
   final String channelId;
   final Set<String> existingPubkeys;
   final bool nativePresentation;
+  final String humanRole;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -109,7 +114,24 @@ class AddChannelMembersSheet extends HookConsumerWidget {
               (user) => !excludedPubkeys.contains(user.pubkey.toLowerCase()),
             )
             .toList() ??
-        const <DirectoryUser>[];
+        <DirectoryUser>[];
+    final actor = ref.watch(currentPubkeyProvider)?.toLowerCase();
+    final ownershipProfiles = ref.watch(userCacheProvider);
+    String groupFor(DirectoryUser user) => !user.isAgent
+        ? 'People'
+        : actor != null &&
+              ownershipProfiles[user.pubkey.toLowerCase()]?.ownerPubkey == actor
+        ? 'Your agents'
+        : 'Other agents';
+    const groupOrder = ['Your agents', 'People', 'Other agents'];
+    availableUsers.sort((a, b) {
+      final group = groupOrder
+          .indexOf(groupFor(a))
+          .compareTo(groupOrder.indexOf(groupFor(b)));
+      return group == 0
+          ? a.label.toLowerCase().compareTo(b.label.toLowerCase())
+          : group;
+    });
     // Compare every shown choice with the channel's members, so a candidate
     // who shares a member's name is told apart before being added. Members
     // are only compared: their names come from the roster the details page
@@ -156,6 +178,10 @@ class AddChannelMembersSheet extends HookConsumerWidget {
         await actions.addMembers(
           channelId: channelId,
           pubkeys: submittedUsers.map((user) => user.pubkey).toList(),
+          roles: {
+            for (final user in submittedUsers)
+              user.pubkey.toLowerCase(): user.isAgent ? 'bot' : humanRole,
+          },
         );
         if (context.mounted) Navigator.of(context).pop(true);
       } on AddMembersException catch (error) {
@@ -199,6 +225,7 @@ class AddChannelMembersSheet extends HookConsumerWidget {
       ]);
       Map<String, Object?> row(DirectoryUser user) => {
         'pubkey': user.pubkey,
+        'group': groupFor(user),
         'name': labelFor(user),
         'detail': user.secondaryLabel,
         'agent': user.isAgent,
@@ -326,48 +353,76 @@ class AddChannelMembersSheet extends HookConsumerWidget {
                             final selected = selectedPubkeys.contains(
                               user.pubkey.toLowerCase(),
                             );
-                            return AppListCardItem(
-                              index: index,
-                              itemCount: availableUsers.length,
-                              dividerIndent: Grid.xs + 40 + Grid.xs,
-                              child: Semantics(
-                                key: ValueKey(
-                                  'add-channel-member-${user.pubkey}',
+                            final group = groupFor(user);
+                            final groupUsers = availableUsers
+                                .where(
+                                  (candidate) => groupFor(candidate) == group,
+                                )
+                                .toList();
+                            return Column(
+                              crossAxisAlignment: CrossAxisAlignment.stretch,
+                              children: [
+                                if (index == 0 ||
+                                    groupFor(availableUsers[index - 1]) !=
+                                        group)
+                                  Semantics(
+                                    container: true,
+                                    header: true,
+                                    child: Padding(
+                                      padding: const EdgeInsets.symmetric(
+                                        vertical: Grid.xxs,
+                                      ),
+                                      child: Text(
+                                        group,
+                                        style: context.textTheme.labelMedium,
+                                      ),
+                                    ),
+                                  ),
+                                AppListCardItem(
+                                  index: groupUsers.indexOf(user),
+                                  itemCount: groupUsers.length,
+                                  dividerIndent: Grid.xs + 40 + Grid.xs,
+                                  child: Semantics(
+                                    container: true,
+                                    key: ValueKey(
+                                      'add-channel-member-${user.pubkey}',
+                                    ),
+                                    button: true,
+                                    selected: selected,
+                                    label: selected
+                                        ? '${labelFor(user)}, selected'
+                                        : labelFor(user),
+                                    child: ListTile(
+                                      leading: AvatarImage(
+                                        imageUrl: user.avatarUrl,
+                                        radius: 20,
+                                        backgroundColor: context.controlSurface,
+                                        fallback: Text(user.initial),
+                                        isAgent: user.isAgent,
+                                      ),
+                                      title: Text(
+                                        labelFor(user),
+                                        maxLines: 1,
+                                        overflow: TextOverflow.ellipsis,
+                                      ),
+                                      subtitle: Text(
+                                        user.secondaryLabel,
+                                        maxLines: 1,
+                                        overflow: TextOverflow.ellipsis,
+                                      ),
+                                      trailing: Icon(
+                                        selected
+                                            ? BuzzIcons.circleCheck
+                                            : BuzzIcons.plus,
+                                        color: selected
+                                            ? context.colors.primary
+                                            : context.colors.onSurfaceVariant,
+                                      ),
+                                      onTap: () => toggleUser(user),
+                                    ),
+                                  ),
                                 ),
-                                button: true,
-                                selected: selected,
-                                label: selected
-                                    ? '${labelFor(user)}, selected'
-                                    : labelFor(user),
-                                child: ListTile(
-                                  leading: AvatarImage(
-                                    imageUrl: user.avatarUrl,
-                                    radius: 20,
-                                    backgroundColor: context.controlSurface,
-                                    fallback: Text(user.initial),
-                                    isAgent: user.isAgent,
-                                  ),
-                                  title: Text(
-                                    labelFor(user),
-                                    maxLines: 1,
-                                    overflow: TextOverflow.ellipsis,
-                                  ),
-                                  subtitle: Text(
-                                    user.secondaryLabel,
-                                    maxLines: 1,
-                                    overflow: TextOverflow.ellipsis,
-                                  ),
-                                  trailing: Icon(
-                                    selected
-                                        ? BuzzIcons.circleCheck
-                                        : BuzzIcons.plus,
-                                    color: selected
-                                        ? context.colors.primary
-                                        : context.colors.onSurfaceVariant,
-                                  ),
-                                  onTap: () => toggleUser(user),
-                                ),
-                              ),
+                              ],
                             );
                           },
                         ),

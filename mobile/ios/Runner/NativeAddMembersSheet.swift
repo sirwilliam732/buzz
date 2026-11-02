@@ -107,6 +107,16 @@ final class NativeAddMembersViewController: UITableViewController, UISearchResul
       !selectedKeys.contains($0["pubkey"] as? String ?? "")
     }
   }
+  private var groups: [(String, [[String: Any]])] {
+    if atLimit || loading || loadError { return [] }
+    return ["Your agents", "People", "Other agents"].compactMap { title in
+      let matches = users.filter { ($0["group"] as? String ?? "People") == title }
+      return matches.isEmpty ? nil : (title, matches)
+    }
+  }
+  private func user(at indexPath: IndexPath) -> [String: Any] {
+    indexPath.section == 0 ? selected[indexPath.row] : groups[indexPath.section - 1].1[indexPath.row]
+  }
   private var checkmarkAction: Bool { state["confirmWithCheckmark"] as? Bool == true }
   private var atLimit: Bool { selected.count >= (state["selectionLimit"] as? Int ?? Int.max) }
   private var busy: Bool { state["submitting"] as? Bool == true }
@@ -215,12 +225,12 @@ final class NativeAddMembersViewController: UITableViewController, UISearchResul
     send("submit", [:])
   }
 
-  override func numberOfSections(in tableView: UITableView) -> Int { 2 }
+  override func numberOfSections(in tableView: UITableView) -> Int { 1 + max(1, groups.count) }
   override func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
-    section == 0 ? selected.count : (atLimit || loading || loadError || users.isEmpty ? 1 : users.count)
+    section == 0 ? selected.count : (groups.isEmpty ? 1 : groups[section - 1].1.count)
   }
   override func tableView(_ tableView: UITableView, titleForHeaderInSection section: Int) -> String? {
-    section == 0 ? (selected.isEmpty ? nil : "Selected") : "People and agents"
+    section == 0 ? (selected.isEmpty ? nil : "Selected") : (groups.isEmpty ? "People and agents" : groups[section - 1].0)
   }
   override func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
     let cell = UITableViewCell(style: .subtitle, reuseIdentifier: nil)
@@ -235,7 +245,7 @@ final class NativeAddMembersViewController: UITableViewController, UISearchResul
       cell.selectionStyle = loadError && !loading ? .default : .none
       if loadError && !loading && !atLimit { cell.accessibilityTraits.insert(.button) }
     } else {
-      let user = indexPath.section == 0 ? selected[indexPath.row] : users[indexPath.row]
+      let user = user(at: indexPath)
       content.text = user["name"] as? String
       content.secondaryText = user["detail"] as? String
       memberLabel = [content.text, content.secondaryText]
@@ -281,7 +291,7 @@ final class NativeAddMembersViewController: UITableViewController, UISearchResul
       if loadError && !loading && !atLimit { send("retry", [:]) }
       return
     }
-    let user = indexPath.section == 0 ? selected[indexPath.row] : users[indexPath.row]
+    let user = user(at: indexPath)
     if let pubkey = user["pubkey"] as? String { send("toggle", ["pubkey": pubkey]) }
   }
 

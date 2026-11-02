@@ -14,6 +14,7 @@ import 'package:buzz/shared/mentions/agent_identity_provider.dart';
 import 'package:buzz/shared/me/me_groups.dart';
 import 'package:buzz/shared/me/me_sync.dart';
 import 'package:buzz/shared/relay/relay.dart';
+import 'package:buzz/shared/relay/relay_author_provider.dart';
 import 'package:buzz/shared/profile/user_cache_provider.dart';
 import 'package:buzz/shared/profile/user_profile.dart';
 import 'package:buzz/shared/widgets/app_list.dart';
@@ -34,6 +35,9 @@ class _EmptyChannels extends ChannelsNotifier {
 }
 
 class _Relay extends RelaySessionNotifier {
+  @override
+  SessionState build() =>
+      const SessionState(status: SessionStatus.disconnected);
   final NostrEvent profile;
   final submitted = <NostrEvent>[];
   _Relay(this.profile, this.existing);
@@ -81,6 +85,19 @@ void main() {
             null,
           ),
         );
+        const connectivity = MethodChannel(
+          'dev.fluttercommunity.plus/connectivity_status',
+        );
+        tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+          connectivity,
+          (_) async => null,
+        );
+        addTearDown(
+          () => tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+            connectivity,
+            null,
+          ),
+        );
         final flutterSheet = defaultTargetPlatform == TargetPlatform.android;
         SharedPreferences.setMockInitialValues({});
         final prefs = await SharedPreferences.getInstance();
@@ -119,8 +136,14 @@ void main() {
                   secretKey: owner.secret,
                   tags: [
                     ['d', channelId],
-                    if (kind == 39000) ['name', 'Mobile Solo'],
-                    if (kind == 39002) ['p', owner.public],
+                    if (kind == 39000) ...[
+                      ['name', 'Mobile Solo'],
+                      ['t', 'stream'],
+                      ['t', 'buzz.solo'],
+                      ['private'],
+                      ['P', owner.public],
+                    ],
+                    if (kind == 39002) ['p', owner.public, '', 'owner'],
                   ],
                 ).toMap(),
               ),
@@ -217,6 +240,11 @@ void main() {
               agentDirectoryProvider.overrideWith((ref) async => []),
               agentOwnersProvider.overrideWith((ref) async => {}),
               customEmojiListProvider.overrideWithValue([]),
+              relayConfigProvider.overrideWith(() => _Config(config)),
+              relayAuthorProvider(
+                config.baseUrl,
+              ).overrideWith((ref) async => owner.public),
+              currentPubkeyProvider.overrideWithValue(owner.public),
               meSyncProvider.overrideWithValue(sync),
               relaySessionProvider.overrideWith(() => relay),
               meGroupsProvider.overrideWith(
@@ -353,4 +381,11 @@ void main() {
       }),
     );
   }
+}
+
+class _Config extends RelayConfigNotifier {
+  _Config(this.config);
+  final RelayConfig config;
+  @override
+  RelayConfig build() => config;
 }

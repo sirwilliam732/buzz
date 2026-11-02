@@ -263,7 +263,7 @@ Widget _buildTestable({
   Future<List<AgentDirectoryEntry>> Function()? loadAgentDirectory,
   Future<Map<String, String>> Function()? loadAgentOwners,
   UserCacheNotifier? userCacheNotifier,
-  List<ChannelMember> members = const [],
+  List<ChannelMember>? members,
   List<ChannelMember> huddleMembers = const [],
   _MutableHuddleMembersNotifier? huddleMembersNotifier,
   Channel? channel,
@@ -312,6 +312,16 @@ Widget _buildTestable({
   ChannelRoutePlacement placement = ChannelRoutePlacement.ordinary,
 }) {
   final resolvedChannel = channel ?? _testChannel;
+  final fixtureMembers =
+      members ??
+      [
+        if (resolvedChannel.isMember)
+          ChannelMember(
+            pubkey: signingPubkey ?? huddleCurrentPubkey ?? 'self',
+            role: 'member',
+            joinedAt: DateTime(2025),
+          ),
+      ];
   final navigatorKey = GlobalKey<NavigatorState>();
   final fakeChannelsNotifier =
       channelsNotifier ?? _FakeChannelsNotifier(channels ?? [resolvedChannel]);
@@ -396,7 +406,7 @@ Widget _buildTestable({
         ),
       ),
       channelMembersProvider(_channelId).overrideWith(
-        (ref) async => loadMembers != null ? loadMembers() : members,
+        (ref) async => loadMembers != null ? loadMembers() : fixtureMembers,
       ),
       channelMembersProvider(_huddleChannelId).overrideWith(
         (ref) async => huddleMembersNotifier == null
@@ -858,6 +868,11 @@ void main() {
           organization: Stream.value(const MeGroups()),
           soloSender: solo,
           members: [
+            ChannelMember(
+              pubkey: session.creator,
+              role: 'owner',
+              joinedAt: DateTime(2026),
+            ),
             ChannelMember(
               pubkey: 'agent',
               role: 'bot',
@@ -3454,6 +3469,8 @@ void main() {
         );
         expect(tester.getSize(aliceRow).height, 40 + (Grid.xxs * 2));
 
+        await tester.ensureVisible(aliceRow);
+        await tester.pumpAndSettle();
         await tester.tap(aliceRow);
         await tester.pumpAndSettle();
         expect(find.byType(UserProfileSheet), findsOneWidget);
@@ -3483,6 +3500,10 @@ void main() {
         ChannelMember(pubkey: 'self', role: 'owner', joinedAt: DateTime(2025)),
       ]);
       await tester.pumpAndSettle();
+      if (find.text('Add people as').evaluate().isNotEmpty) {
+        await tester.tap(find.text('Participating'));
+        await tester.pumpAndSettle();
+      }
       expect(
         find.byKey(const ValueKey('channel-details-add-members-row')),
         findsOneWidget,
@@ -3500,6 +3521,10 @@ void main() {
       );
       await tester.pump();
       await tester.pumpAndSettle();
+      if (find.text('Add people as').evaluate().isNotEmpty) {
+        await tester.tap(find.text('Participating'));
+        await tester.pumpAndSettle();
+      }
 
       await tester.tap(
         find.byKey(const ValueKey('channel-header-settings-trigger')),
@@ -3511,6 +3536,26 @@ void main() {
         findsNothing,
       );
       expect(find.text('Members unavailable'), findsOneWidget);
+    });
+
+    testWidgets('owned channel settings stay readable without a signing key', (
+      tester,
+    ) async {
+      final channel = Channel.fromJson({
+        ..._testChannel.toJson(),
+        'created_by': 'self',
+      });
+      await tester.pumpWidget(
+        _buildTestable(messages: const [], channel: channel),
+      );
+      await tester.pumpAndSettle();
+      await tester.tap(
+        find.byKey(const ValueKey('channel-header-settings-trigger')),
+      );
+      await tester.pumpAndSettle();
+      expect(find.text('General access'), findsOneWidget);
+      expect(find.text('Convert to channel'), findsNothing);
+      expect(tester.takeException(), isNull);
     });
 
     testWidgets('small channel shows all members without a See all row', (
@@ -3536,6 +3581,10 @@ void main() {
         ),
       );
       await tester.pumpAndSettle();
+      if (find.text('Add people as').evaluate().isNotEmpty) {
+        await tester.tap(find.text('Participating'));
+        await tester.pumpAndSettle();
+      }
 
       await tester.tap(
         find.byKey(const ValueKey('channel-header-settings-trigger')),
@@ -3553,9 +3602,12 @@ void main() {
       expect(addRow, findsOneWidget);
       expect(memberRow, findsOneWidget);
       expect(seeAllRow, findsNothing);
-      await tester.tap(
-        find.byKey(const ValueKey('channel-details-member-alice')),
+      final aliceRow = find.byKey(
+        const ValueKey('channel-details-member-alice'),
       );
+      await tester.ensureVisible(aliceRow);
+      await tester.pumpAndSettle();
+      await tester.tap(aliceRow);
       await tester.pumpAndSettle();
       expect(find.byType(UserProfileSheet), findsOneWidget);
       expect(find.text('Make channel admin'), findsOneWidget);
@@ -3716,11 +3768,14 @@ void main() {
           'a11ce00000000000000000000000000000000000000000000000000000000000';
       const carol =
           'c010100000000000000000000000000000000000000000000000000000000000';
+      const agent =
+          'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
       await tester.pumpWidget(
         _buildTestable(
           messages: const [],
           users: {
             carol: const UserProfile(pubkey: carol, displayName: 'Carol'),
+            agent: const UserProfile(pubkey: agent, displayName: 'Agent'),
           },
           members: [
             ChannelMember(
@@ -3746,7 +3801,8 @@ void main() {
                 joinedAt: DateTime(2025),
               ),
             ChannelMember(
-              pubkey: 'agent',
+              pubkey: agent,
+              displayName: 'Agent',
               role: 'bot',
               joinedAt: DateTime(2025),
             ),
@@ -3827,14 +3883,30 @@ void main() {
       await tester.pumpAndSettle();
       // Verify each group when it enters the lazy sheet viewport.
       expect(find.text('People · 6'), findsOneWidget);
-      await tester.drag(
-        find.byKey(const ValueKey('members-sheet-list')),
-        const Offset(0, -500),
+      await tester.scrollUntilVisible(
+        find.text('Agent'),
+        100,
+        scrollable: find.descendant(
+          of: find.byKey(const ValueKey('members-sheet-list')),
+          matching: find.byType(Scrollable),
+        ),
       );
       await tester.pumpAndSettle();
       expect(find.text('Agents · 1'), findsOneWidget);
       expect(find.text('Agent'), findsOneWidget);
       expect(find.text('Bot'), findsNothing);
+      final agentRow = find.ancestor(
+        of: find.text('Agent'),
+        matching: find.byType(ListTile),
+      );
+      expect(
+        tester
+            .widget<AvatarImage>(
+              find.descendant(of: agentRow, matching: find.byType(AvatarImage)),
+            )
+            .isAgent,
+        isTrue,
+      );
     });
 
     testWidgets('Add members keeps its close control below the safe top', (
@@ -3874,6 +3946,10 @@ void main() {
         find.byKey(const ValueKey('channel-details-add-members-row')),
       );
       await tester.pumpAndSettle();
+      if (find.text('Add people as').evaluate().isNotEmpty) {
+        await tester.tap(find.text('Participating'));
+        await tester.pumpAndSettle();
+      }
 
       final sheet = find.byType(BottomSheet).last;
       final closeButton = find.byTooltip('Close sheet');
@@ -3913,6 +3989,10 @@ void main() {
         find.byKey(const ValueKey('channel-details-add-members-row')),
       );
       await tester.pumpAndSettle();
+      if (find.text('Add people as').evaluate().isNotEmpty) {
+        await tester.tap(find.text('Participating'));
+        await tester.pumpAndSettle();
+      }
 
       await tester.pump();
       final unselectedSemantics = tester.getSemantics(
@@ -3988,6 +4068,10 @@ void main() {
           find.byKey(const ValueKey('channel-details-add-members-row')),
         );
         await tester.pumpAndSettle();
+        if (find.text('Add people as').evaluate().isNotEmpty) {
+          await tester.tap(find.text('Participating'));
+          await tester.pumpAndSettle();
+        }
 
         await tester.tap(
           find.byKey(const ValueKey('add-channel-member-alice')),
@@ -11741,7 +11825,9 @@ void main() {
     expect(find.byType(ComposeBar), findsNothing);
     expect(find.byKey(const ValueKey('me-assistant-button')), findsNothing);
     expect(
-      find.text('Join this channel from Manage to participate.'),
+      find.text(
+        'This chat is read-only. Ask an owner or admin to participate.',
+      ),
       findsOneWidget,
     );
     expect(ordinary.sent, isEmpty);
@@ -13013,7 +13099,7 @@ void main() {
       );
       final payload = view.creationParams! as Map<String, Object?>;
       expect(payload['title'], 'general');
-      expect(payload['subtitle'], '0 members');
+      expect(payload['subtitle'], '1 member');
       expect(payload['titleEnabled'], isTrue);
       final actions = payload['actions']! as List;
       expect(actions, hasLength(1));
@@ -13338,8 +13424,14 @@ void main() {
       final firstActionBottom = tester
           .getRect(find.byKey(const ValueKey('channel-details-star-action')))
           .bottom;
+      final accessRow = find.byKey(const ValueKey('channel-details-access'));
+      final accessBottom = tester.getRect(accessRow).bottom;
       final membersLabelTop = tester.getRect(find.text('5 members')).top;
-      expect(membersLabelTop - firstActionBottom, closeTo(Grid.sm, 0.5));
+      expect(
+        tester.getRect(accessRow).top - firstActionBottom,
+        closeTo(Grid.sm, 0.5),
+      );
+      expect(membersLabelTop - accessBottom, closeTo(Grid.sm, 0.5));
       expect(
         tester
             .widget<AppListCard>(
@@ -19148,6 +19240,7 @@ class _FakeChannelActions extends ChannelActions {
     required String channelId,
     required List<String> pubkeys,
     String role = 'member',
+    Map<String, String> roles = const {},
   }) async {
     await onAddMembers?.call(channelId, pubkeys);
   }
