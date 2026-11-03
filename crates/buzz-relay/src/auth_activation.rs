@@ -381,6 +381,26 @@ impl crate::state::AppState {
         }
     }
 
+    /// Stop ticket admission, then wait for every owned producer before retiring.
+    /// The caller must retain its hard-exit backstop; unknown termination stays
+    /// pending instead of being converted to retirement by a timeout.
+    pub async fn drain_and_retire_auth_activation(&self) -> buzz_db::Result<()> {
+        if self.auth_activation_boot.get().is_none() {
+            return Ok(());
+        }
+        metrics::counter!("buzz_nip_fi_activation_retirement_attempts_total").increment(1);
+        loop {
+            let changed = self.auth_activation.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.retire_auth_activation().await? {
+                metrics::counter!("buzz_nip_fi_activation_retirement_success_total").increment(1);
+                return Ok(());
+            }
+            changed.await;
+        }
+    }
+
     /// Register the process before listener admission and reconcile missed policy
     /// notifications every five seconds. No lease expiry or fleet eviction.
     /// The production verifier is absent, so baseline completion stays disabled.

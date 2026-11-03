@@ -2282,33 +2282,9 @@ async fn serve(
     let drain_conn_manager = Arc::clone(&state.conn_manager);
     let drain_jitter_ms = state.config.drain_jitter_ms;
     let tx = shutdown_tx.clone();
-    // TODO(coverage): `serve`'s shutdown wiring has no automated test. The
-    // jittered drain helper (`ConnectionManager::drain_all_jittered`) is
-    // covered in `state.rs`, but coverage of the helper is not coverage of
-    // its use here: the three wiring facts below are currently unguarded, and
-    // mutating any one of them leaves the suite green.
-    //   1. Jitter dispatch: `drain_jitter_ms == 0` must pick `drain_all`, and
-    //      a non-zero value must pick `drain_all_jittered(drain_jitter_ms)`.
-    //      A mutant that inverts this condition ships jitter-off in prod.
-    //   2. The shutdown handle must be awaited before the abort. Dropping the
-    //      `shutdown_handle.await` (both the UDS and TCP-only return paths) is
-    //      the exact shape of the previously shipped detached-timer bug,
-    //      relocated from the helper to the call site: the runtime can exit
-    //      before delayed closes flush, so no client sees a 1012.
-    //   3. `shutdown_tx.send(true)` must reach every listener's
-    //      `with_graceful_shutdown` future, on both the UDS and TCP-only paths.
-    //
-    // A focused test would refactor the drain/dispatch decision and the
-    // listener-shutdown fan-out into a small seam that does not need a bound
-    // socket or a real SIGTERM. One shape: extract the body of this spawned
-    // task into a `run_graceful_shutdown(state, shutdown_tx)` fn parameterised
-    // over a signal future and a clock, inject a fake `ConnectionManager`
-    // (or a trait over `drain_all` / `drain_all_jittered`) that records which
-    // path ran, drive it with `tokio::time` paused, and assert: (a) the right
-    // drain path ran for jitter 0 vs non-zero, (b) the drain future completed
-    // before the abort fired, and (c) each subscribed `watch` receiver
-    // observed `true`. This keeps the test off real ports and off wall-clock
-    // sleeps. Not implemented here. This comment records the plan only.
+    // The real TCP-only SIGTERM witness holds a writer operation across the
+    // restart Close and verifies retirement only after release. Jitter dispatch
+    // and UDS fan-out additionally use the same joined shutdown tail below.
     let shutdown_handle = tokio::spawn(async move {
         shutdown_signal().await;
         shutdown_state.begin_shutdown();
@@ -2362,7 +2338,7 @@ async fn serve(
     step.finish();
 
     #[cfg(unix)]
-    if let Some(ref uds_path) = config.uds_path {
+    let uds_handle = if let Some(ref uds_path) = config.uds_path {
         use std::os::unix::fs::FileTypeExt as _;
         match std::fs::symlink_metadata(uds_path) {
             Ok(meta) if meta.file_type().is_socket() => {
@@ -2381,51 +2357,24 @@ async fn serve(
 
         let router_uds = router.clone();
         let mut uds_rx = shutdown_tx.subscribe();
-        let uds_handle = tokio::spawn(async move {
+        Some(tokio::spawn(async move {
             axum::serve(uds_listener, router_uds.into_make_service())
                 .with_graceful_shutdown(async move {
                     uds_rx.changed().await.ok();
                 })
                 .await
-                .ok();
-        });
-
-        let mut tcp_rx = shutdown_tx.subscribe();
-        axum::serve(
-            tcp_listener,
-            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-        )
-        .with_graceful_shutdown(async move {
-            tcp_rx.changed().await.ok();
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("TCP server error: {e}"))?;
-
-        let hard_shutdown = shutdown_handle
-            .await
-            .map_err(|e| anyhow::anyhow!("Shutdown task failed: {e}"))?;
-        uds_handle.abort();
-        // Cancel and join the JWKS refresh task so it doesn't outlive the process.
-        // The hard-exit backstop stays armed until the join completes.
-        jwks_refresh_cancel.cancel();
-        if let Some(h) = jwks_refresh_handle {
-            if let Err(e) = h.await {
-                tracing::warn!(error = %e, "NIP-FI: JWKS refresh supervisor join error on shutdown");
-            }
-        }
-        if let Err(error) = state.retire_auth_activation().await {
-            tracing::warn!(%error,"activation retirement remains pending");
-        }
-        hard_shutdown.abort();
-        return Ok(());
-    }
+                .map_err(|e| anyhow::anyhow!("UDS server error: {e}"))
+        }))
+    } else {
+        None
+    };
 
     #[cfg(not(unix))]
     if config.uds_path.is_some() {
         tracing::warn!("BUZZ_UDS_PATH set but UDS not supported on this platform");
     }
 
-    // TCP-only path.
+    // Both transports join the same graceful retirement path.
     let mut tcp_rx = shutdown_tx.subscribe();
     axum::serve(
         tcp_listener,
@@ -2440,6 +2389,12 @@ async fn serve(
     let hard_shutdown = shutdown_handle
         .await
         .map_err(|e| anyhow::anyhow!("Shutdown task failed: {e}"))?;
+    #[cfg(unix)]
+    if let Some(handle) = uds_handle {
+        handle
+            .await
+            .map_err(|e| anyhow::anyhow!("UDS task failed: {e}"))??;
+    }
     // Cancel and join the JWKS refresh task so it doesn't outlive the process.
     // The hard-exit backstop stays armed until the join completes.
     jwks_refresh_cancel.cancel();
@@ -2448,6 +2403,9 @@ async fn serve(
             tracing::warn!(error = %e, "NIP-FI: JWKS refresh supervisor join error on shutdown");
         }
     }
+    // Axum does not own upgraded sockets or detached HTTP producers. Keep the
+    // process backstop armed while their tickets (including audit work) drain.
+    state.drain_and_retire_auth_activation().await?;
     hard_shutdown.abort();
     Ok(())
 }
