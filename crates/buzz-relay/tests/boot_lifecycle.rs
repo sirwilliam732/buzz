@@ -895,27 +895,22 @@ mod postgres_tests {
             ("BUZZ_NIP_FI_ACTIVATION_TRACKING_ENABLED", "false"),
         ]);
         wait_for_blocked_registration(&pool, &mut held, &mut process).await;
-        let status = tokio::time::timeout(Duration::from_secs(15), async {
-            loop {
-                assert!(
-                    tokio::net::TcpStream::connect(("127.0.0.1", health))
-                        .await
-                        .is_err(),
-                    "failed registration must never expose readiness"
-                );
-                assert!(
-                    tokio::net::TcpStream::connect(&bind).await.is_err(),
-                    "failed registration must never expose public admission"
-                );
-                if let Some(status) = process.try_wait() {
-                    break status;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("registration timeout must terminate the relay");
-        let output = process.collect(status);
+        assert!(
+            tokio::net::TcpStream::connect(("127.0.0.1", health))
+                .await
+                .is_err(),
+            "failed registration must never expose readiness"
+        );
+        assert!(
+            tokio::net::TcpStream::connect(&bind).await.is_err(),
+            "failed registration must never expose public admission"
+        );
+        // Wait on the process, not an unpaced stream of TCP probes that can
+        // exhaust loopback resources shared with the other integration tests.
+        // The captured bind logs below cover the entire remaining lifetime:
+        // health is logged before its server is spawned, so it cannot have
+        // briefly advertised Ready between these probes and the failed exit.
+        let output = process.wait(Duration::from_secs(15));
         let logs = format!(
             "{}{}",
             String::from_utf8_lossy(&output.stdout),
