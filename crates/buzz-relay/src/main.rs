@@ -2267,16 +2267,6 @@ async fn serve(
 ) -> anyhow::Result<()> {
     let config = &state.config;
 
-    let step = StepTimer::start(StartupStep::HealthBind);
-    let health_listener = tokio::net::TcpListener::bind(("0.0.0.0", config.health_port))
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to bind health port {}: {e}", config.health_port))?;
-    step.finish();
-    info!(port = config.health_port, "Health probe listener started");
-    tokio::spawn(async move {
-        axum::serve(health_listener, health_router).await.ok();
-    });
-
     let (shutdown_tx, _) = tokio::sync::watch::channel(false);
     let shutdown_state = Arc::clone(&state);
     let drain_conn_manager = Arc::clone(&state.conn_manager);
@@ -2373,6 +2363,18 @@ async fn serve(
     if config.uds_path.is_some() {
         tracing::warn!("BUZZ_UDS_PATH set but UDS not supported on this platform");
     }
+
+    // An answering health listener proves activation startup and every public
+    // listener bind succeeded; failed registration must never advertise Ready.
+    let step = StepTimer::start(StartupStep::HealthBind);
+    let health_listener = tokio::net::TcpListener::bind(("0.0.0.0", config.health_port))
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to bind health port {}: {e}", config.health_port))?;
+    step.finish();
+    info!(port = config.health_port, "Health probe listener started");
+    tokio::spawn(async move {
+        axum::serve(health_listener, health_router).await.ok();
+    });
 
     // Both transports join the same graceful retirement path.
     let mut tcp_rx = shutdown_tx.subscribe();

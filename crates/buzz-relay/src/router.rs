@@ -1200,7 +1200,8 @@ async fn kubernetes_readiness_handler(State(state): State<Arc<AppState>>) -> imp
 /// answer, which meant one shared outage removed every replica from the load
 /// balancer simultaneously and left a reconnect burst with nowhere to land.
 /// Those checks now report on `/_status`. The health listener does not bind
-/// until the database, migrations, Redis, and pub/sub are up (see
+/// until the database, migrations, Redis, pub/sub, required activation startup,
+/// and public listener binds have succeeded (see
 /// `buzz-relay/src/main.rs`), so an answering process is a booted process and
 /// needs no separate startup state.
 fn readiness_reason(state: &AppState) -> ReadinessReason {

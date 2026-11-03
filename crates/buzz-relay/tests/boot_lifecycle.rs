@@ -573,6 +573,27 @@ fn successful_main_emits_complete_lifecycle_and_reports_current_startup_step() {
 mod postgres_tests {
     use super::*;
 
+    async fn wait_for_blocked_registration(
+        pool: &sqlx::PgPool,
+        held: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        process: &mut RelayProcess,
+    ) {
+        let holder: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut **held)
+            .await
+            .unwrap();
+        tokio::time::timeout(CHILD_TIMEOUT, async {
+            loop {
+                assert!(process.try_wait().is_none(), "relay exited before registration wait");
+                let waiting: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid)))"
+                ).bind(holder).fetch_one(pool).await.unwrap();
+                if waiting { break; }
+                tokio::task::yield_now().await;
+            }
+        }).await.expect("relay must wait on the held activation scope");
+    }
+
     /// Boots the real TCP-only binary and holds either an admitted EVENT or
     /// audio teardown at a writer lock across SIGTERM. A restart Close cannot
     /// retire the incarnation while that handler/effect is still outstanding.
@@ -618,8 +639,8 @@ mod postgres_tests {
         let metrics = reserve_closed_port().to_string();
         let bind = format!("127.0.0.1:{}", reserve_closed_port());
         let image = format!("shutdown-fixture-{}", uuid::Uuid::new_v4());
-        // Force health readiness to precede activation registration, as it can
-        // in CI. Private readiness is not proof the public listener is bound.
+        // Hold required startup at registration. Neither health readiness nor
+        // public admission may be exposed until this succeeds.
         let mut startup_hold = pool.begin().await.unwrap();
         sqlx::query("SELECT pg_advisory_xact_lock(1112883541,0)")
             .execute(&mut *startup_hold)
@@ -639,7 +660,15 @@ mod postgres_tests {
             ("BUZZ_NIP_FI_ACTIVATION_TRACKING_ENABLED", "true"),
             ("BUZZ_RELAY_IMAGE_DIGEST", &image),
         ]);
-        assert!(wait_for_readiness(&mut process, health).starts_with("HTTP/1.1 200"));
+        wait_for_blocked_registration(&pool, &mut startup_hold, &mut process).await;
+        assert!(
+            TcpStream::connect(("127.0.0.1", health)).is_err(),
+            "health must not bind before registration"
+        );
+        assert!(
+            tokio::net::TcpStream::connect(&bind).await.is_err(),
+            "public listener must not bind before registration"
+        );
         let registered: i64 =
             sqlx::query_scalar("SELECT count(*) FROM community_auth_boots WHERE image=$1")
                 .bind(&image)
@@ -648,9 +677,10 @@ mod postgres_tests {
                 .unwrap();
         assert_eq!(
             registered, 0,
-            "registration is deliberately held after readiness"
+            "registration is deliberately held before readiness"
         );
         startup_hold.commit().await.unwrap();
+        assert!(wait_for_readiness(&mut process, health).starts_with("HTTP/1.1 200"));
         tokio::time::timeout(CHILD_TIMEOUT, async {
             loop {
                 assert!(
@@ -837,52 +867,70 @@ mod postgres_tests {
         sigterm_retires_after_held_work(true).await;
     }
 
-    #[test]
+    #[tokio::test]
     #[ignore = "requires PostgreSQL"]
-    fn armed_registration_timeout_prevents_public_listener_even_with_switch_off() {
+    async fn armed_registration_timeout_prevents_ready_and_public_listener_even_with_switch_off() {
         let database_url = std::env::var("DATABASE_URL").unwrap();
         let redis_url = std::env::var("REDIS_URL").unwrap();
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        let (pool, held) = runtime.block_on(async {
-            let pool = sqlx::PgPool::connect(&database_url).await.unwrap();
-            sqlx::query("INSERT INTO community_auth_baseline(singleton,epoch) VALUES(true,1) ON CONFLICT(singleton) DO UPDATE SET epoch=1")
-                .execute(&pool).await.unwrap();
-            let mut held = pool.begin().await.unwrap();
-            sqlx::query("SELECT pg_advisory_xact_lock(1112883541,0)").execute(&mut *held).await.unwrap();
-            (pool, held)
-        });
+        let pool = sqlx::PgPool::connect(&database_url).await.unwrap();
+        sqlx::query("INSERT INTO community_auth_baseline(singleton,epoch) VALUES(true,1) ON CONFLICT(singleton) DO UPDATE SET epoch=1")
+            .execute(&pool).await.unwrap();
+        let mut held = pool.begin().await.unwrap();
+        sqlx::query("SELECT pg_advisory_xact_lock(1112883541,0)")
+            .execute(&mut *held)
+            .await
+            .unwrap();
         let metrics = reserve_closed_port().to_string();
-        let health = reserve_closed_port().to_string();
+        let health = reserve_closed_port();
+        let health_value = health.to_string();
         let bind = format!("127.0.0.1:{}", reserve_closed_port());
-        let (exited, output) = run_until_exit(
-            &[
-                ("BUZZ_RELAY_PRIVATE_KEY", VALID_RELAY_PRIVATE_KEY),
-                ("DATABASE_URL", &database_url),
-                ("REDIS_URL", &redis_url),
-                ("BUZZ_METRICS_PORT", &metrics),
-                ("BUZZ_HEALTH_PORT", &health),
-                ("BUZZ_BIND_ADDR", &bind),
-                ("BUZZ_GIT_CONFORMANCE_PROBE", "false"),
-                ("BUZZ_NIP_FI_ACTIVATION_TRACKING_ENABLED", "false"),
-            ],
-            Duration::from_secs(15),
-        );
+        let mut process = RelayProcess::spawn(&[
+            ("BUZZ_RELAY_PRIVATE_KEY", VALID_RELAY_PRIVATE_KEY),
+            ("DATABASE_URL", &database_url),
+            ("REDIS_URL", &redis_url),
+            ("BUZZ_METRICS_PORT", &metrics),
+            ("BUZZ_HEALTH_PORT", &health_value),
+            ("BUZZ_BIND_ADDR", &bind),
+            ("BUZZ_GIT_CONFORMANCE_PROBE", "false"),
+            ("BUZZ_NIP_FI_ACTIVATION_TRACKING_ENABLED", "false"),
+        ]);
+        wait_for_blocked_registration(&pool, &mut held, &mut process).await;
+        let status = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                assert!(
+                    tokio::net::TcpStream::connect(("127.0.0.1", health))
+                        .await
+                        .is_err(),
+                    "failed registration must never expose readiness"
+                );
+                assert!(
+                    tokio::net::TcpStream::connect(&bind).await.is_err(),
+                    "failed registration must never expose public admission"
+                );
+                if let Some(status) = process.try_wait() {
+                    break status;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("registration timeout must terminate the relay");
+        let output = process.collect(status);
         let logs = format!(
             "{}{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        assert!(exited && !output.status.success(), "{logs}");
+        assert!(!output.status.success(), "{logs}");
         assert!(
             logs.contains("auth activation startup registration failed"),
             "{logs}"
         );
+        assert!(!logs.contains("Health probe listener started"), "{logs}");
         assert!(!logs.contains("buzz-relay TCP listening"), "{logs}");
         assert!(TcpListener::bind(&bind).is_ok());
-        runtime.block_on(async {
-            held.rollback().await.unwrap();
-            pool.close().await;
-        });
+        held.rollback().await.unwrap();
+        pool.close().await;
     }
 
     const REDIS_BOOTSTRAP_BUDGET: Duration = Duration::from_secs(5);

@@ -367,7 +367,9 @@ Any operation, a positive baseline epoch, or a verified baseline forces startup
 registration regardless of this setting. Epochs only advance, including on
 invalidation; invalidating a baseline cannot restore bypass. Registration and the
 bypass decision serialize with enable and baseline changes. No registration error
-falls back to unregistered public serving. Registered boots keep reconciling and
+falls back to unregistered public serving. The health listener binds only after
+activation startup and TCP/UDS listener binding succeed, so blocked or failed
+registration cannot expose Ready. Registered boots keep reconciling and
 draining even if operators later disable acceptance or change deployment settings.
 A replacement boot installs all durable requirements before listening. The
 reconciler only ACKs its own unsatisfied obligations; already satisfied operations
