@@ -327,11 +327,12 @@ snapshot alone is insufficient. No such authority is included here.
 
 Before an eventual baseline is armed, all serving routes must be covered.
 After arming, a new process must participate before serving *any* host, including
-free hosts, or durably invalidate the epoch under the scope lock before serving.
-Without writer access it cannot do either. This adds startup/scale-out
+free hosts. Invalidating the epoch does not restore startup bypass. Without writer
+access it cannot register and cannot open the public listener. This adds startup/scale-out
 availability cost. Already-participating free sessions preserve existing outage
 behavior; there are no periodic registration leases or automatic fleet drains.
-The first draft's startup fallback is dark-only and cannot establish a baseline.
+These are startup guarantees. Already-running bypass boots have no reconcile
+worker; observation closes untracked sockets but cannot establish a baseline.
 
 Baseline invalidation makes otherwise eligible operations pending; lifecycle,
 required-policy or issuer-trust loss still wins as unavailable. Historical
@@ -374,6 +375,15 @@ cause no repeated ACK transaction while production completion is disabled. When 
 future trusted authority verifies an epoch, it must recompute completion from
 persisted exact ACKs under the scope lock; already satisfied boots must not need
 perpetual ACK writes to trigger that transition.
+
+On its first durable observation of a required community, a running bypass boot
+installs the floor and signals that community's untracked root/audio sockets with
+Close 1008 `community authentication upgraded`. The registry remembers the
+observation by immutable community ID so a late untracked registration also
+closes; tracked compliant reconnects survive. This does not start a reconciliation
+worker or register the dark boot. A hint alone is not an observation. Cancellation
+cannot establish that every dark boot observed the change or that untracked HTTP,
+handler or producer work drained, and produces no boot ACK or active evidence.
 
 A **dark bypass boot is not a verified participant**. There is no production
 arming endpoint in this draft. A future trusted arming authority must establish
@@ -422,7 +432,8 @@ remain pending. Both TCP and UDS must stop accepting and join, followed by all
 socket/handler/body/audit tickets, before a boot persists retirement. SIGTERM
 signals a sticky audio-only Close 1012 drain in the same process; audio upgrades
 racing shutdown also self-cancel, while root sockets retain their existing jitter
-policy. This does not drain other boots or expire unrelated sessions. The existing
+policy. Audio SIGTERM Close 1012 applies on every boot, including dark bypass
+boots. This does not drain other boots or expire unrelated sessions. The existing
 hard-exit backstop remains armed throughout; it never converts an unknown drain
 to retirement.
 

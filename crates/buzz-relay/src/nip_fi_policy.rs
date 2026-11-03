@@ -110,9 +110,7 @@ pub(crate) async fn resolve(
     };
     if state.auth_activation_tracking_enabled() || policy.requires_nip_fi {
         if policy.requires_nip_fi {
-            state
-                .auth_activation
-                .require(&policy.community_id.to_string(), policy.policy_generation);
+            state.observe_required_auth_policy(policy.community_id, policy.policy_generation);
         }
         if policy.policy_generation
             < state
@@ -174,9 +172,7 @@ pub(crate) async fn bind_for_upgrade(
         _ => return Err(not_found()),
     };
     if policy.requires_nip_fi {
-        state
-            .auth_activation
-            .require(&policy.community_id.to_string(), policy.policy_generation);
+        state.observe_required_auth_policy(policy.community_id, policy.policy_generation);
     }
     if policy.policy_generation
         < state

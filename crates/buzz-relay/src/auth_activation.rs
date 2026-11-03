@@ -379,6 +379,15 @@ pub(crate) fn enforce_current(issuer: &str) -> bool {
 }
 
 impl crate::state::AppState {
+    /// Observe primary policy before scanning dark sockets. This installs no
+    /// boot/ACK evidence and cannot prove untracked producers have drained.
+    pub(crate) fn observe_required_auth_policy(&self, community: uuid::Uuid, generation: i64) {
+        self.auth_activation
+            .require(&community.to_string(), generation);
+        self.community_connections
+            .require_untracked_auth(buzz_core::CommunityId::from_uuid(community));
+    }
+
     pub(crate) fn auth_activation_tracking_enabled(&self) -> bool {
         self.config.nip_fi_activation_tracking_enabled
             || self.auth_activation_boot.get().is_some()
@@ -525,6 +534,31 @@ mod postgres_tests;
 
 #[cfg(test)]
 mod ownership_tests {
+    #[test]
+    fn observed_dark_requirement_catches_late_untracked_registration_only() {
+        let registry = crate::state::CommunityConnectionRegistry::new();
+        let target = buzz_core::CommunityId::from_uuid(uuid::Uuid::new_v4());
+        let unrelated = buzz_core::CommunityId::from_uuid(uuid::Uuid::new_v4());
+        let old = crate::state::CommunityConnectionControl::new(CancellationToken::new());
+        let free = crate::state::CommunityConnectionControl::new(CancellationToken::new());
+        let _old = registry.register(uuid::Uuid::new_v4(), target, old.clone());
+        let _free = registry.register(uuid::Uuid::new_v4(), unrelated, free.clone());
+        assert_eq!(registry.require_untracked_auth(target), 1);
+        assert!(old.cancellation_token().is_cancelled());
+        assert!(!free.cancellation_token().is_cancelled());
+        let late = crate::state::CommunityConnectionControl::new_audio(CancellationToken::new());
+        let _late = registry.register(uuid::Uuid::new_v4(), target, late.clone());
+        assert!(late.cancellation_token().is_cancelled());
+        let tracker = Arc::new(WorkTracker::default());
+        let ticket = tracker.enter(&target.as_uuid().to_string(), 1).unwrap();
+        let current = WORK.sync_scope(ticket, || {
+            crate::state::CommunityConnectionControl::new(CancellationToken::new())
+        });
+        let _current = registry.register(uuid::Uuid::new_v4(), target, current.clone());
+        assert_eq!(registry.require_untracked_auth(target), 0);
+        assert!(!current.cancellation_token().is_cancelled());
+    }
+
     #[test]
     fn process_audio_drain_is_sticky_without_cancelling_root_jitter() {
         let registry = crate::state::CommunityConnectionRegistry::new();
