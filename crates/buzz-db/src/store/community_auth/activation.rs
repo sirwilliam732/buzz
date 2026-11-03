@@ -122,7 +122,7 @@ impl Db {
     pub async fn auth_activation_targets(&self, boot: Uuid) -> Result<Vec<ActivationTarget>> {
         Ok(sqlx::query_as("SELECT u.target_community_id,u.operation_id,u.expected_host,u.expected_issuer,u.policy_generation,u.accepted_at
             FROM community_auth_upgrades u JOIN community_auth_obligations o USING(operation_id)
-            WHERE o.boot_id=$1 AND o.policy_generation=u.policy_generation AND (o.satisfied_at IS NULL OR u.activated_at IS NULL OR NOT EXISTS(SELECT 1 FROM community_auth_baseline b WHERE b.singleton AND b.verified AND b.epoch=u.activation_epoch))
+            WHERE o.boot_id=$1 AND o.policy_generation=u.policy_generation AND o.satisfied_at IS NULL
             ORDER BY u.operation_id").bind(boot).fetch_all(&self.pool).await?)
     }
 

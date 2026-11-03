@@ -569,6 +569,10 @@ async fn activation_exact_ack_baseline_invalidation_and_restart_journey() {
     let satisfied: bool = sqlx::query_scalar("SELECT satisfied_at IS NOT NULL FROM community_auth_obligations WHERE operation_id=$1 AND boot_id=$2 AND policy_generation=$3")
         .bind(request.operation_id).bind(boot).bind(generation).fetch_one(db.pool()).await.unwrap();
     assert!(satisfied);
+    // Baseline unverified is not a reason to repeat an already satisfied ACK.
+    assert!(db.auth_activation_targets(boot).await.unwrap().is_empty());
+    db.invalidate_auth_baseline().await.unwrap();
+    assert!(db.auth_activation_targets(boot).await.unwrap().is_empty());
     super::activation::verify_baseline_for_test(&db).await;
     assert!(db.acknowledge_auth_drain(ack).await.unwrap());
     let active = db
