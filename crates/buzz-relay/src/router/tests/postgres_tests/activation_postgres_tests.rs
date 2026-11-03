@@ -10,6 +10,7 @@ mod postgres_tests {
         let base = real_db_state().await.unwrap();
         let mut configured = (*base).clone();
         Arc::make_mut(&mut configured.config).nip_fi.mode = buzz_auth::NipFiMode::Off;
+        Arc::make_mut(&mut configured.config).nip_fi_activation_tracking_enabled = true;
         let state = Arc::new(configured);
         let keys = nostr::Keys::generate();
         let owner = keys.public_key().to_hex();

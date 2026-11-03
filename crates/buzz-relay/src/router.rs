@@ -243,6 +243,13 @@ async fn nip_fi_assertion_guard(
     if policy.stored_required && state.nip_fi_deny_map.is_none() {
         return nip_fi_unavailable(&slot);
     }
+    if !state.auth_activation_tracking_enabled() {
+        return crate::nip_fi_policy::with_policy(
+            policy,
+            nip_fi_assertion_guard_with_policy(state, request, next, policy.mode),
+        )
+        .await;
+    }
     let Some(ticket) = state
         .auth_activation
         .enter(&policy.community_id.to_string(), policy.generation)
@@ -1085,6 +1092,21 @@ async fn nip11_or_ws_handler(
             });
             limit_relay_websocket(ws, max_frame_bytes)
                 .on_upgrade(move |socket| async move {
+                    if !state.auth_activation_tracking_enabled() {
+                        handle_connection(
+                            socket,
+                            state,
+                            addr,
+                            tenant,
+                            nip_fi_assertion,
+                            shadow,
+                            shadow_line,
+                            connection_time,
+                        )
+                        .await;
+                        return;
+                    }
+
                     let Some(ticket) = state.auth_activation.enter(
                         &tenant.community().as_uuid().to_string(),
                         admitted_generation,

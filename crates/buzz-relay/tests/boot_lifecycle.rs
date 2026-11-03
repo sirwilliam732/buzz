@@ -731,6 +731,54 @@ mod postgres_tests {
         );
     }
 
+    #[test]
+    #[ignore = "requires PostgreSQL"]
+    fn armed_registration_timeout_prevents_public_listener_even_with_switch_off() {
+        let database_url = std::env::var("DATABASE_URL").unwrap();
+        let redis_url = std::env::var("REDIS_URL").unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (pool, held) = runtime.block_on(async {
+            let pool = sqlx::PgPool::connect(&database_url).await.unwrap();
+            sqlx::query("INSERT INTO community_auth_baseline(singleton,epoch) VALUES(true,1) ON CONFLICT(singleton) DO UPDATE SET epoch=1")
+                .execute(&pool).await.unwrap();
+            let mut held = pool.begin().await.unwrap();
+            sqlx::query("SELECT pg_advisory_xact_lock(1112883541,0)").execute(&mut *held).await.unwrap();
+            (pool, held)
+        });
+        let metrics = reserve_closed_port().to_string();
+        let health = reserve_closed_port().to_string();
+        let bind = format!("127.0.0.1:{}", reserve_closed_port());
+        let (exited, output) = run_until_exit(
+            &[
+                ("BUZZ_RELAY_PRIVATE_KEY", VALID_RELAY_PRIVATE_KEY),
+                ("DATABASE_URL", &database_url),
+                ("REDIS_URL", &redis_url),
+                ("BUZZ_METRICS_PORT", &metrics),
+                ("BUZZ_HEALTH_PORT", &health),
+                ("BUZZ_BIND_ADDR", &bind),
+                ("BUZZ_GIT_CONFORMANCE_PROBE", "false"),
+                ("BUZZ_NIP_FI_ACTIVATION_TRACKING_ENABLED", "false"),
+            ],
+            Duration::from_secs(15),
+        );
+        let logs = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(exited && !output.status.success(), "{logs}");
+        assert!(
+            logs.contains("auth activation startup registration failed"),
+            "{logs}"
+        );
+        assert!(!logs.contains("buzz-relay TCP listening"), "{logs}");
+        assert!(TcpListener::bind(&bind).is_ok());
+        runtime.block_on(async {
+            held.rollback().await.unwrap();
+            pool.close().await;
+        });
+    }
+
     const REDIS_BOOTSTRAP_BUDGET: Duration = Duration::from_secs(5);
     const REDIS_BOOTSTRAP_SCHEDULING_SLACK: Duration = Duration::from_secs(3);
 

@@ -108,19 +108,21 @@ pub(crate) async fn resolve(
             ))
         }
     };
-    if policy.requires_nip_fi {
-        state
-            .auth_activation
-            .require(&policy.community_id.to_string(), policy.policy_generation);
-    }
-    if policy.policy_generation
-        < state
-            .auth_activation
-            .floor(&policy.community_id.to_string())
-    {
-        return Err(crate::nip_fi_core::http_denial(
-            DenialClass::AuthorizationUnavailable,
-        ));
+    if state.auth_activation_tracking_enabled() || policy.requires_nip_fi {
+        if policy.requires_nip_fi {
+            state
+                .auth_activation
+                .require(&policy.community_id.to_string(), policy.policy_generation);
+        }
+        if policy.policy_generation
+            < state
+                .auth_activation
+                .floor(&policy.community_id.to_string())
+        {
+            return Err(crate::nip_fi_core::http_denial(
+                DenialClass::AuthorizationUnavailable,
+            ));
+        }
     }
     tracing::trace!(
         generation = policy.policy_generation,

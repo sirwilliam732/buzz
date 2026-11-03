@@ -778,3 +778,42 @@ async fn activation_registration_and_lifecycle_lock_order_journey() {
         }
     }
 }
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn dark_bypass_is_atomic_and_armed_or_operation_scopes_cannot_disable_tracking() {
+    let (db, request, _) = fixture().await;
+    let skipped = Uuid::new_v4();
+    assert!(db
+        .prepare_auth_boot(skipped, "dark", false)
+        .await
+        .unwrap()
+        .is_none());
+    let count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM community_auth_boots WHERE boot_id=$1")
+            .bind(skipped)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(count, 0);
+    // Dark opt-in crashes remain registered; no absence/age-based discharge.
+    let crashed = Uuid::new_v4();
+    db.prepare_auth_boot(crashed, "pre-arming-crash", true)
+        .await
+        .unwrap()
+        .unwrap();
+    accepted(&db, &request).await;
+    let boot = Uuid::new_v4();
+    assert!(db
+        .prepare_auth_boot(boot, "off-after-operation", false)
+        .await
+        .unwrap()
+        .is_some());
+    assert_eq!(db.auth_activation_targets(crashed).await.unwrap().len(), 1);
+    db.invalidate_auth_baseline().await.unwrap();
+    assert!(db
+        .prepare_auth_boot(Uuid::new_v4(), "off-after-invalidation", false)
+        .await
+        .unwrap()
+        .is_some());
+}

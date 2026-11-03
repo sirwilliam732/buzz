@@ -351,3 +351,84 @@ Required communities admitted under global Shadow use real FI sessions. Signed
 administrative disconnect commands now close matching enforced sessions locally
 and across pods independently of the global rollout mode. Optional shadow
 observations remain in their separate observation registry.
+
+## Tracking rollout and abort criteria (BUZZ-512 partial draft)
+
+`BUZZ_NIP_FI_ACTIVATION_TRACKING_ENABLED=false` is the default pre-arming
+setting. With both tracking and upgrade acceptance disabled, a writer scope with
+no operations, `verified=false`, and baseline epoch zero may skip boot registration,
+work tickets, per-frame tracker locks and detached HTTP ownership. Startup still
+checks that condition under the writer scope lock; a writer error prevents the
+public listener from opening. Enabling upgrade acceptance also opts the boot into
+tracking. The registered boot remains tracked for its whole process lifetime.
+
+Any operation, a positive baseline epoch, or a verified baseline forces startup
+registration regardless of this setting. Epochs only advance, including on
+invalidation; invalidating a baseline cannot restore bypass. Registration and the
+bypass decision serialize with enable and baseline changes. No registration error
+falls back to unregistered public serving. Registered boots keep reconciling and
+draining even if operators later disable acceptance or change deployment settings.
+A replacement boot installs all durable requirements before listening. The
+reconciler only ACKs its own unsatisfied obligations; already satisfied operations
+cause no repeated ACK transaction while production completion is disabled.
+
+A **dark bypass boot is not a verified participant**. There is no production
+arming endpoint in this draft. A future trusted arming authority must establish
+that every route is covered by registered tracking-capable boots and that every
+dark bypass boot has permanently stopped serving and cannot reenter before
+advancing the epoch. A config rollout, registry list, or readiness observation is
+insufficient. Before enabling upgrade acceptance, stop/restart every bypass boot into
+registered tracking; do not accept the first operation while any bypass boot
+can still serve. A dark boot does not discover an arming transition in the
+background: the missing authority must establish permanent exclusion of every
+such incarnation. Starting this build with tracking disabled is not permission
+to arm a mixed fleet. Dark opt-in boots that crash remain durable participants and become
+pending obligations at enable; they cannot disappear at first arming. Likewise,
+boots which predate registration need trusted inventory and non-serving/no-reentry
+evidence. Any exclusion/discharge must record that evidence under the scope lock,
+invalidate the epoch, and reverify coverage. Age, missing heartbeats, registry
+absence, replaced pods, and inferred node death are never evidence of retirement.
+**Production `active` remains disabled until that authority is implemented and
+reviewed in BUZZ-512.**
+
+While tracking is on, protected HTTP handlers run in owned Tokio tasks. Client
+disconnect does not cancel an admitted handler or its in-flight DB effects.
+Response producers, queued audit entries and workflow descendants retain their
+work ticket through cleanup; cancelled generations cannot deliver more protected
+response frames. A handler panic is logged and maps to 503
+`authorization_unavailable` when a response is still possible. This differs from
+untracked requests, which run in their caller's future. Each ticket enter/drop and
+protected response-frame poll takes a process-wide mutex; compliant traffic can
+contend with floor installation. The manual `activation_tracking_mutex_cost`
+microbenchmark measures uncontended and four-thread enter/drop plus empty body
+poll cost. These synthetic costs do not establish production tail latency or
+throughput; load-test the actual HTTP, root and audio mix before arming.
+
+Roll out dark tracking to a small controlled cohort first, retaining upgrade
+acceptance off. Compare authoritative serving inventory against registered boot
+IDs, images and `serving_at`; registration is before public bind, so the registry
+alone overcounts rather than proving serving coverage. Monitor
+`buzz_nip_fi_activation_tracking_enabled`,
+`buzz_nip_fi_activation_registration_success_total`,
+`buzz_nip_fi_activation_retirement_attempts_total`,
+`buzz_nip_fi_activation_retirement_success_total`, local obligation counts/oldest
+pending age, scope-lock timeout logs, DB pool wait, request latency, CPU and
+memory against the same workload on bypass boots. Retirement success is meaningful
+only for observed graceful exits; OOM/SIGKILL and drain-timeout boots intentionally
+remain pending. Both TCP and UDS must stop accepting and join, followed by all
+socket/handler/body/audit tickets, before a boot persists retirement. The existing
+hard-exit backstop remains armed throughout; it never converts an unknown drain
+to retirement.
+
+Abort progression on any serving boot without registration in the proposed armed
+coverage, unexpected registration failure, graceful exit without retirement,
+unexplained pending growth, scope-lock/pool pressure, lost policy closes, or a
+material request latency/throughput regression against the cohort baseline.
+Before arming, stop expanding the cohort and disable acceptance; a bypass rollout
+requires trusted confirmation that no operation/armed epoch exists. After arming,
+disable **new acceptance only**, retain required-policy enforcement, reconciliation
+and drains, and repair/retry pending work. Do not reset epochs, delete obligations,
+turn off tracking for serving participants, or drain the fleet automatically.
+Generation cancellation and post-upgrade refusal use Close 1008 with reason
+`community authentication upgraded`; reconnect with a fresh, valid required
+assertion. Handshake-time refusals retain their HTTP denial behavior.

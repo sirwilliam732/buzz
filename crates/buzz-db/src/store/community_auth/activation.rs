@@ -84,6 +84,21 @@ impl Db {
         boot: Uuid,
         image: &str,
     ) -> Result<Vec<ActivationTarget>> {
+        self.prepare_auth_boot(boot, image, true)
+            .await?
+            .ok_or_else(|| DbError::AccessDenied("requested tracking was skipped".into()))
+    }
+
+    /// Decide dark-phase bypass and registration under the participant scope lock.
+    /// A positive baseline epoch is an irreversible arming/invalidation latch;
+    /// existing operations also require tracking regardless of local configuration.
+    /// Lookup/registration failure is startup-fatal, never an unregistered fallback.
+    pub async fn prepare_auth_boot(
+        &self,
+        boot: Uuid,
+        image: &str,
+        requested: bool,
+    ) -> Result<Option<Vec<ActivationTarget>>> {
         let mut tx = self.pool.begin().await?;
         lock(&mut tx).await?;
         sqlx::query(
@@ -91,6 +106,12 @@ impl Db {
         )
         .execute(&mut *tx)
         .await?;
+        let required: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM community_auth_baseline WHERE epoch>0 OR verified) OR EXISTS(SELECT 1 FROM community_auth_upgrades)")
+            .fetch_one(&mut *tx).await?;
+        if !requested && !required {
+            tx.commit().await?;
+            return Ok(None);
+        }
         let inserted = sqlx::query(
             "INSERT INTO community_auth_boots(boot_id,image) VALUES($1,$2) ON CONFLICT DO NOTHING",
         )
@@ -115,7 +136,7 @@ impl Db {
         let targets = sqlx::query_as("SELECT target_community_id,operation_id,expected_host,expected_issuer,policy_generation,accepted_at FROM community_auth_upgrades ORDER BY operation_id")
             .fetch_all(&mut *tx).await?;
         tx.commit().await?;
-        Ok(targets)
+        Ok(Some(targets))
     }
 
     /// Read unsatisfied obligations from the writer; notifications are hints only.

@@ -2320,15 +2320,12 @@ async fn serve(
         hard_shutdown_abort
     });
 
-    // Registration precedes public listener binding. With no trusted production
-    // baseline verifier this is dark tracking; failure cannot assert completion.
-    let _auth_activation = match state.start_auth_activation().await {
-        Ok(task) => Some(task),
-        Err(error) => {
-            tracing::warn!(%error, "auth activation tracking unavailable; completion disabled");
-            None
-        }
-    };
+    // Establish dark/armed state from the writer before public admission. An
+    // unavailable scope cannot prove bypass safe; registration never falls back.
+    let _auth_activation = state
+        .start_auth_activation()
+        .await
+        .map_err(|error| anyhow::anyhow!("auth activation startup registration failed: {error}"))?;
 
     let step = StepTimer::start(StartupStep::ListenerBind);
     let tcp_listener = tokio::net::TcpListener::bind(&config.bind_addr)

@@ -25,6 +25,7 @@ pub(crate) struct WorkTracker {
     changed: Notify,
     reconcile: Notify,
     stopped: std::sync::atomic::AtomicBool,
+    observed_requirement: std::sync::atomic::AtomicBool,
 }
 
 impl WorkTracker {
@@ -41,6 +42,8 @@ impl WorkTracker {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let entry = hosts.entry(host.to_owned()).or_default();
         entry.floor = entry.floor.max(generation);
+        self.observed_requirement
+            .store(true, std::sync::atomic::Ordering::Release);
         for (admitted, _, cancel) in entry.work.values() {
             if *admitted < entry.floor {
                 cancel.cancel();
@@ -376,6 +379,15 @@ pub(crate) fn enforce_current(issuer: &str) -> bool {
 }
 
 impl crate::state::AppState {
+    pub(crate) fn auth_activation_tracking_enabled(&self) -> bool {
+        self.config.nip_fi_activation_tracking_enabled
+            || self.auth_activation_boot.get().is_some()
+            || self
+                .auth_activation
+                .observed_requirement
+                .load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// Called only after listeners stop and owned request/socket work has exited.
     /// A hard-shutdown or unfinished task leaves the boot pending for recovery.
     pub async fn retire_auth_activation(&self) -> buzz_db::Result<bool> {
@@ -412,12 +424,14 @@ impl crate::state::AppState {
         }
     }
 
-    /// Register the process before listener admission and reconcile missed policy
-    /// notifications every five seconds. No lease expiry or fleet eviction.
+    /// Establish dark bypass or register before listener admission, then reconcile
+    /// missed policy notifications. `None` means a proven unarmed scope with both
+    /// rollout switches off; any writer/registration failure must prevent serving.
+    /// Reconciliation runs every five seconds. No lease expiry or fleet eviction.
     /// The production verifier is absent, so baseline completion stays disabled.
     pub async fn start_auth_activation(
         self: &Arc<Self>,
-    ) -> buzz_db::Result<tokio_util::task::AbortOnDropHandle<()>> {
+    ) -> buzz_db::Result<Option<tokio_util::task::AbortOnDropHandle<()>>> {
         let boot = uuid::Uuid::new_v4();
         if self.auth_activation_boot.get().is_some() {
             return Err(buzz_db::DbError::AccessDenied(
@@ -426,7 +440,21 @@ impl crate::state::AppState {
         }
         let image = std::env::var("BUZZ_RELAY_IMAGE_DIGEST")
             .unwrap_or_else(|_| format!("unverified-version:{}", env!("CARGO_PKG_VERSION")));
-        let targets = self.db.register_auth_boot(boot, &image).await?;
+        let Some(targets) = self
+            .db
+            .prepare_auth_boot(
+                boot,
+                &image,
+                self.config.nip_fi_activation_tracking_enabled
+                    || self.config.nip_fi_upgrades_enabled,
+            )
+            .await?
+        else {
+            metrics::gauge!("buzz_nip_fi_activation_tracking_enabled").set(0.0);
+            return Ok(None);
+        };
+        metrics::gauge!("buzz_nip_fi_activation_tracking_enabled").set(1.0);
+        metrics::counter!("buzz_nip_fi_activation_registration_success_total").increment(1);
         let _ = self.auth_activation_boot.set(boot);
         for target in &targets {
             self.auth_activation.require_issuer(
@@ -436,8 +464,8 @@ impl crate::state::AppState {
             );
         }
         let state = self.clone();
-        Ok(tokio_util::task::AbortOnDropHandle::new(tokio::spawn(
-            async move {
+        Ok(Some(tokio_util::task::AbortOnDropHandle::new(
+            tokio::spawn(async move {
                 let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
@@ -485,11 +513,13 @@ impl crate::state::AppState {
                         }
                     }
                 }
-            },
+            }),
         )))
     }
 }
 
+#[cfg(test)]
+mod cost_tests;
 #[cfg(test)]
 mod postgres_tests;
 

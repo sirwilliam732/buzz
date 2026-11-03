@@ -217,6 +217,22 @@ pub async fn ws_audio_handler(
         )
     });
     limit_audio_websocket(ws).on_upgrade(move |socket| async move {
+        if !state.auth_activation_tracking_enabled() {
+            handle_audio_connection(
+                socket,
+                state,
+                tenant,
+                channel_id,
+                permit,
+                nip_fi_assertion,
+                shadow,
+                shadow_line,
+                connection_time,
+            )
+            .await;
+            return;
+        }
+
         let Some(ticket) = state.auth_activation.enter(
             &tenant.community().as_uuid().to_string(),
             admitted_generation,

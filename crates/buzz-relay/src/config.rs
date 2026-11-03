@@ -418,6 +418,10 @@ pub struct Config {
     /// recovery/status remain available (`BUZZ_NIP_FI_UPGRADES_ENABLED`).
     pub nip_fi_upgrades_enabled: bool,
 
+    /// Opt into pre-arming activation tracking and owned HTTP work. Once the
+    /// writer scope is armed or has operations, false cannot disable tracking.
+    pub nip_fi_activation_tracking_enabled: bool,
+
     /// Database resolver bounds (`BUZZ_NIP_FI_RESOLVER_*`,
     /// `BUZZ_NIP_FI_SNAPSHOT_*`). Validated in every mode, so a bad value
     /// fails the deploy that sets it, not the later switch to shadow.
@@ -1529,6 +1533,11 @@ impl Config {
             serve_git_web_gui,
             nip_fi_provision_binding,
             nip_fi_upgrades_enabled: parse_bool("BUZZ_NIP_FI_UPGRADES_ENABLED", false)?,
+            nip_fi_activation_tracking_enabled: std::env::var(
+                "BUZZ_NIP_FI_ACTIVATION_TRACKING_ENABLED",
+            )
+            .map(|value| value == "true")
+            .unwrap_or(false),
             nip_fi_resolver_bounds,
             nip_fi,
         })
@@ -1629,6 +1638,34 @@ mod tests {
         match before {
             Some(value) => std::env::set_var("BUZZ_NIP_FI_UPGRADES_ENABLED", value),
             None => std::env::remove_var("BUZZ_NIP_FI_UPGRADES_ENABLED"),
+        }
+    }
+
+    #[test]
+    fn activation_tracking_is_explicitly_default_off() {
+        let (_fi, _cfg) = env_guards();
+        let before = std::env::var("BUZZ_NIP_FI_ACTIVATION_TRACKING_ENABLED").ok();
+        std::env::remove_var("BUZZ_NIP_FI_ACTIVATION_TRACKING_ENABLED");
+        assert!(
+            !Config::from_env()
+                .unwrap()
+                .nip_fi_activation_tracking_enabled
+        );
+        std::env::set_var("BUZZ_NIP_FI_ACTIVATION_TRACKING_ENABLED", "true");
+        assert!(
+            Config::from_env()
+                .unwrap()
+                .nip_fi_activation_tracking_enabled
+        );
+        std::env::set_var("BUZZ_NIP_FI_ACTIVATION_TRACKING_ENABLED", "false");
+        assert!(
+            !Config::from_env()
+                .unwrap()
+                .nip_fi_activation_tracking_enabled
+        );
+        match before {
+            Some(value) => std::env::set_var("BUZZ_NIP_FI_ACTIVATION_TRACKING_ENABLED", value),
+            None => std::env::remove_var("BUZZ_NIP_FI_ACTIVATION_TRACKING_ENABLED"),
         }
     }
 
