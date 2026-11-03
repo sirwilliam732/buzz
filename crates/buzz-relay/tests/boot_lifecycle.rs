@@ -573,6 +573,164 @@ fn successful_main_emits_complete_lifecycle_and_reports_current_startup_step() {
 mod postgres_tests {
     use super::*;
 
+    /// Boots the real default TCP-only binary, holds an admitted EVENT at a
+    /// writer lock, and sends real SIGTERM. A restart Close cannot retire its
+    /// incarnation while that handler/effect is still outstanding.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL"]
+    async fn tcp_only_sigterm_retires_only_after_real_held_work_drains() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
+        let database_url = std::env::var("DATABASE_URL").unwrap();
+        let redis_url = std::env::var("REDIS_URL").unwrap();
+        let pool = sqlx::PgPool::connect(&database_url).await.unwrap();
+        let db = buzz_db::Db::from_pool(pool.clone());
+        let key = nostr::Keys::generate();
+        let host = format!("shutdown-{}.example", uuid::Uuid::new_v4());
+        let _ = db
+            .create_community_with_owner(&host, &key.public_key().to_hex(), &key)
+            .await
+            .unwrap();
+        let health = reserve_closed_port();
+        let health_value = health.to_string();
+        let metrics = reserve_closed_port().to_string();
+        let bind = format!("127.0.0.1:{}", reserve_closed_port());
+        let image = format!("shutdown-fixture-{}", uuid::Uuid::new_v4());
+        let mut process = RelayProcess::spawn(&[
+            ("BUZZ_RELAY_PRIVATE_KEY", VALID_RELAY_PRIVATE_KEY),
+            ("DATABASE_URL", &database_url),
+            ("REDIS_URL", &redis_url),
+            ("BUZZ_METRICS_PORT", &metrics),
+            ("BUZZ_HEALTH_PORT", &health_value),
+            ("BUZZ_BIND_ADDR", &bind),
+            ("BUZZ_GIT_CONFORMANCE_PROBE", "false"),
+            // Hold actual writer work beyond the five-second routing grace.
+            ("BUZZ_DB_LOCK_TIMEOUT_MS", "20000"),
+            ("BUZZ_DB_STATEMENT_TIMEOUT_MS", "25000"),
+            ("BUZZ_NIP_FI_ACTIVATION_TRACKING_ENABLED", "true"),
+            ("BUZZ_RELAY_IMAGE_DIGEST", &image),
+        ]);
+        assert!(wait_for_readiness(&mut process, health).starts_with("HTTP/1.1 200"));
+        let boot: uuid::Uuid =
+            sqlx::query_scalar("SELECT boot_id FROM community_auth_boots WHERE image=$1")
+                .bind(&image)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let mut request = format!("ws://{bind}/").into_client_request().unwrap();
+        request.headers_mut().insert("host", host.parse().unwrap());
+        let (mut client, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+        let Message::Text(challenge) = client.next().await.unwrap().unwrap() else {
+            panic!("challenge")
+        };
+        let challenge: serde_json::Value = serde_json::from_str(&challenge).unwrap();
+        let auth = nostr::EventBuilder::new(nostr::Kind::Authentication, "")
+            .tag(nostr::Tag::parse(["relay", &format!("ws://{host}")]).unwrap())
+            .tag(nostr::Tag::parse(["challenge", challenge[1].as_str().unwrap()]).unwrap())
+            .sign_with_keys(&key)
+            .unwrap();
+        client
+            .send(Message::Text(
+                serde_json::json!(["AUTH", auth]).to_string().into(),
+            ))
+            .await
+            .unwrap();
+        loop {
+            if let Some(Ok(Message::Text(t))) =
+                tokio::time::timeout(Duration::from_secs(10), client.next())
+                    .await
+                    .unwrap()
+            {
+                let value: serde_json::Value = serde_json::from_str(&t).unwrap();
+                if value[0] == "OK" {
+                    assert_eq!(value[2], true, "{value}");
+                    break;
+                }
+            }
+        }
+        let mut held = pool.begin().await.unwrap();
+        sqlx::query("LOCK TABLE events IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *held)
+            .await
+            .unwrap();
+        let lock_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *held)
+            .await
+            .unwrap();
+        let event = nostr::EventBuilder::new(nostr::Kind::TextNote, "held graceful shutdown")
+            .sign_with_keys(&key)
+            .unwrap();
+        let event_id = event.id.to_bytes().to_vec();
+        client
+            .send(Message::Text(
+                serde_json::json!(["EVENT", event]).to_string().into(),
+            ))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let waiting: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND $1=ANY(pg_blocking_pids(pid)))")
+                    .bind(lock_pid).fetch_one(&pool).await.unwrap();
+                if waiting { break; }
+                tokio::task::yield_now().await;
+            }
+        }).await.unwrap();
+        let pid = process.child.as_ref().unwrap().id().to_string();
+        assert!(Command::new("/bin/kill")
+            .args(["-TERM", &pid])
+            .status()
+            .unwrap()
+            .success());
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(Ok(Message::Close(Some(close)))) = client.next().await {
+                    assert_eq!(u16::from(close.code), 1012);
+                    let _ = client.flush().await;
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let retired: bool = sqlx::query_scalar(
+            "SELECT retired_at IS NOT NULL FROM community_auth_boots WHERE boot_id=$1",
+        )
+        .bind(boot)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(!retired, "SIGTERM and Close are not a work-drain proof");
+        assert!(process.try_wait().is_none());
+        held.commit().await.unwrap();
+        let output = tokio::task::spawn_blocking(move || process.wait(Duration::from_secs(12)))
+            .await
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let retired: bool = sqlx::query_scalar(
+            "SELECT retired_at IS NOT NULL FROM community_auth_boots WHERE boot_id=$1",
+        )
+        .bind(boot)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let persisted: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM events WHERE id=$1)")
+            .bind(event_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(persisted, "held EVENT must finish before the process exits");
+        assert!(
+            retired,
+            "TCP-only graceful completion must persist retirement"
+        );
+    }
+
     const REDIS_BOOTSTRAP_BUDGET: Duration = Duration::from_secs(5);
     const REDIS_BOOTSTRAP_SCHEDULING_SLACK: Duration = Duration::from_secs(3);
 
