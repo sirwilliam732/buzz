@@ -2884,6 +2884,7 @@ mod tests {
     // does not run in the unit-test lane where no DB is available.
     mod postgres_tests {
         mod activation_postgres_tests;
+        mod socket_activation_postgres_tests;
         use super::*;
         use std::sync::Arc;
 
