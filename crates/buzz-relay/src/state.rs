@@ -551,6 +551,8 @@ impl CommunityConnectionRegistry {
         if !self.untracked_auth_requirements.insert(community_id) {
             return 0;
         }
+        #[cfg(test)]
+        crate::nip_fi_test_hooks::auth_requirement_scan_hook::before_scan(community_id);
         let mut signalled = 0;
         for entry in self.connections.iter() {
             let (community, control) = entry.value();

@@ -438,3 +438,41 @@ pub(crate) mod pairing_reached_counter {
 pub(crate) fn record_pairing_reached_after_cancel(community: CommunityId) {
     pairing_reached_counter::increment(community);
 }
+
+/// Deterministic synchronous gap between the first requirement latch and scan.
+/// Tests run the observer on a blocking thread; production has no hook.
+pub(crate) mod auth_requirement_scan_hook {
+    use super::*;
+    type Gate = (
+        tokio::sync::oneshot::Sender<()>,
+        std::sync::mpsc::Receiver<()>,
+    );
+    static GATES: std::sync::LazyLock<
+        std::sync::Mutex<std::collections::HashMap<CommunityId, Gate>>,
+    > = std::sync::LazyLock::new(Default::default);
+
+    pub(crate) fn arm(
+        community: CommunityId,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (arrived_tx, arrived_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        GATES
+            .lock()
+            .unwrap()
+            .insert(community, (arrived_tx, release_rx));
+        (arrived_rx, release_tx)
+    }
+
+    pub(crate) fn before_scan(community: CommunityId) {
+        let gate = GATES.lock().unwrap().remove(&community);
+        if let Some((arrived, release)) = gate {
+            let _ = arrived.send(());
+            release
+                .recv_timeout(std::time::Duration::from_secs(15))
+                .expect("release first requirement scan");
+        }
+    }
+}

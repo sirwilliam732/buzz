@@ -323,7 +323,15 @@ mod postgres_tests {
         client
     }
 
-    async fn dark_observation_journey(bind_first: bool) {
+    enum DarkObservation {
+        Resolve,
+        Bind,
+        ConcurrentScan,
+    }
+
+    async fn dark_observation_journey(observation: DarkObservation) {
+        let bind_first = matches!(observation, DarkObservation::Bind);
+        let scan_control = matches!(observation, DarkObservation::ConcurrentScan);
         use crate::nip_fi_core::test_support::{
             assertion_verifier, sign_assertion, TEST_COMMUNITY_URI, TEST_ISSUER,
         };
@@ -410,6 +418,45 @@ mod postgres_tests {
         let mut audio = authenticated_socket(addr, &host, &path, &key, None, true).await;
         let mut free = authenticated_socket(addr, &free_host, "/", &key, None, false).await;
         assert!(!state.auth_activation_tracking_enabled());
+        if scan_control {
+            let other_host = format!("tracked-other-{}.example", uuid::Uuid::new_v4());
+            let other = state
+                .db
+                .create_community_with_owner_and_nip_fi_issuers(
+                    &other_host,
+                    &owner,
+                    &[TEST_ISSUER.into()],
+                    &key,
+                )
+                .await
+                .unwrap();
+            let buzz_db::CreateCommunityWithOwnerResult::Created(other) = other.outcome else {
+                panic!("other");
+            };
+            let other_request = UpgradeRequest {
+                operation_id: uuid::Uuid::new_v4(),
+                community_id: *other.id.as_uuid(),
+                expected_host: other_host.clone(),
+                actor_pubkey: owner.clone(),
+                expected_owner_pubkey: owner.clone(),
+                expected_issuer: TEST_ISSUER.into(),
+                operator_pubkey: owner.clone(),
+            };
+            assert!(matches!(
+                state
+                    .db
+                    .enable_community_nip_fi(&other_request, Ok(()))
+                    .await
+                    .unwrap(),
+                UpgradeOutcome::Accepted(_)
+            ));
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert("host", other_host.parse().unwrap());
+            crate::nip_fi_policy::resolve(&state, &headers)
+                .await
+                .unwrap();
+            assert!(state.auth_activation_tracking_enabled());
+        }
         let request = UpgradeRequest {
             operation_id: uuid::Uuid::new_v4(),
             community_id: *row.id.as_uuid(),
@@ -427,6 +474,64 @@ mod postgres_tests {
         else {
             panic!("enable")
         };
+        if scan_control {
+            // The first observer can pause after latching, while another request
+            // admits current-generation tracked sockets before that first scan.
+            let (arrived, release) =
+                crate::nip_fi_test_hooks::auth_requirement_scan_hook::arm(row.id);
+            let observer_state = state.clone();
+            let observer_host = host.clone();
+            let runtime = tokio::runtime::Handle::current();
+            let observer = tokio::task::spawn_blocking(move || {
+                runtime
+                    .block_on(crate::nip_fi_policy::bind_for_upgrade(
+                        &observer_state,
+                        &observer_host,
+                    ))
+                    .unwrap()
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(10), arrived)
+                .await
+                .unwrap()
+                .unwrap();
+            let token = sign_assertion("nip-fi+jwt", &key.public_key().to_hex(), None);
+            let mut current_root =
+                authenticated_socket(addr, &host, "/", &key, Some(&token), false).await;
+            let mut current_audio =
+                authenticated_socket(addr, &host, &path, &key, Some(&token), true).await;
+            release.send(()).unwrap();
+            observer.await.unwrap();
+            for client in [&mut root, &mut audio] {
+                // Audio can announce the compliant peer joining before it
+                // flushes this older peer's terminal close.
+                let close = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    loop {
+                        if let Message::Close(Some(close)) =
+                            frame(client, "first scan legacy close").await
+                        {
+                            break close;
+                        }
+                    }
+                })
+                .await
+                .unwrap();
+                assert_eq!(u16::from(close.code), 1008);
+                let _ = client.flush().await;
+            }
+            for client in [&mut current_root, &mut current_audio, &mut free] {
+                ping_round_trip(client).await;
+            }
+            assert!(state.auth_activation_boot.get().is_none());
+            let obligations: i64 =
+                sqlx::query_scalar("SELECT count(*) FROM community_auth_obligations")
+                    .fetch_one(state.db.pool())
+                    .await
+                    .unwrap();
+            assert_eq!(obligations, 0);
+            drop((current_root, current_audio, free));
+            server.abort();
+            return;
+        }
         // No reconcile worker exists. A real FI reconnect makes the first durable
         // observation and must close the older untracked sockets without itself closing.
         if bind_first {
@@ -528,13 +633,19 @@ mod postgres_tests {
     #[ignore = "requires Postgres"]
     async fn dark_observation_closes_existing_root_and_audio_without_ack_and_preserves_reconnects()
     {
-        dark_observation_journey(false).await;
+        dark_observation_journey(DarkObservation::Resolve).await;
     }
 
     #[tokio::test]
     #[ignore = "requires Postgres"]
     async fn dark_binding_observation_closes_existing_root_and_audio_without_ack() {
-        dark_observation_journey(true).await;
+        dark_observation_journey(DarkObservation::Bind).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn first_requirement_scan_preserves_concurrently_admitted_compliant_tracked_sockets() {
+        dark_observation_journey(DarkObservation::ConcurrentScan).await;
     }
 
     async fn ping_round_trip(client: &mut Client) {
