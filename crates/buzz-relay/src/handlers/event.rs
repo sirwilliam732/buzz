@@ -450,7 +450,7 @@ pub(crate) async fn dispatch_persistent_event(
     let actor_pubkey_hex = actor_pubkey_hex.to_owned();
 
     metrics::counter!("buzz_post_commit_dispatch_scheduled_total").increment(1);
-    tokio::spawn(async move {
+    crate::auth_activation::spawn(async move {
         let recipients = dispatch_persistent_event_inner(
             &tenant,
             &state,
@@ -578,9 +578,11 @@ async fn dispatch_persistent_event_inner(
         // community keeps a colliding channel id in B from triggering A's
         // workflows.
         let workflow_community = tenant.community();
-        tokio::spawn(async move {
+        crate::auth_activation::spawn(async move {
             if let Err(e) = workflow_engine
-                .on_event(workflow_community, &workflow_event)
+                .on_event_with_spawner(workflow_community, &workflow_event, |task| {
+                    crate::auth_activation::spawn(task);
+                })
                 .await
             {
                 tracing::error!(event_id = ?workflow_event.event.id, "Workflow trigger failed: {e}");

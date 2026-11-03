@@ -220,3 +220,8 @@ CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
 \i tables/public/community_auth_upgrades.sql
 \i seeds/community_auth_upgrades.sql
+
+\i tables/public/community_auth_baseline.sql
+\i tables/public/community_auth_boots.sql
+\i tables/public/community_auth_obligations.sql
+\i seeds/community_auth_activation.sql

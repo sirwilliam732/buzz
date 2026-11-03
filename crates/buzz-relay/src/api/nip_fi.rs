@@ -20,7 +20,8 @@
 //! ## Environment variables
 //!
 //! The command API is enabled when `BUZZ_NIP_FI_MODE` is `enforce` or
-//! `shadow` (shadow keeps the deny entry but closes no session).  S4 fields
+//! `shadow`. Commands close enforced FI sessions in either mode; optional
+//! shadow observations remain non-disruptive. S4 fields
 //! are read from the same `BUZZ_NIP_FI_ISSUERS` JSON array as the assertion
 //! policy; in both modes every issuer entry must carry them:
 //!
@@ -137,20 +138,20 @@ pub async fn disconnect(
             let pubkey_bytes = cmd.target_pubkey.to_bytes();
             // Issuer-scoped: the deny entry is keyed by (caller_iss, k), so only
             // sessions admitted under caller_iss are closed. [FI-TRACE-DENY-SET]
-            // Shadow keeps the deny entry but closes nothing.
-            let closed = if !state.config.nip_fi.mode.observes_only() {
-                state
-                    .conn_manager
-                    .disconnect_nip_fi(&cmd.caller_iss, &pubkey_bytes)
-                    + state
-                        .community_connections
-                        .disconnect_nip_fi(&cmd.caller_iss, &pubkey_bytes)
-            } else {
+            // Enforced admissions live in the real registries, including
+            // required communities under global Shadow. Optional observations
+            // live only in the shadow registry and remain non-disruptive.
+            let closed = state
+                .conn_manager
+                .disconnect_nip_fi(&cmd.caller_iss, &pubkey_bytes)
+                + state
+                    .community_connections
+                    .disconnect_nip_fi(&cmd.caller_iss, &pubkey_bytes);
+            if state.config.nip_fi.mode.observes_only() {
                 state
                     .nip_fi_shadow_sessions
                     .would_close(&cmd.caller_iss, &pubkey_bytes);
-                0
-            };
+            }
             if closed > 0 {
                 // [FI-TRACE-PRIVACY-NONPUBLIC]: raw `iss` MUST NOT appear in
                 // logs, metrics, or traces.  Log only a count.
@@ -158,7 +159,7 @@ pub async fn disconnect(
             }
             let mode = state.config.nip_fi.mode;
             count_disconnect_event(mode, "buzz_nip_fi_disconnect_total", "admin", "accepted", 1);
-            if !mode.observes_only() {
+            if !mode.observes_only() || closed > 0 {
                 metrics::counter!(
                     "buzz_nip_fi_sessions_closed_total",
                     "reason" => "admin_disconnect"
@@ -234,14 +235,12 @@ pub struct NipFiCommandComponents<F: JwksFetcher = buzz_auth::HttpJwksFetcher> {
     pub command_verifier: Arc<CommandVerifier<Arc<ProductionJwksSource<F>>>>,
 }
 
-/// Channel this pod publishes accepted disconnects on.  Shadow uses its own
-/// channel, so no enforce pod (of any build) ever acts on a shadow command.
-pub fn disconnect_publish_channel(mode: NipFiMode) -> &'static str {
-    if mode.observes_only() {
-        buzz_pubsub::conn_control::NIP_FI_SHADOW_DISCONNECT_CHANNEL
-    } else {
-        buzz_pubsub::conn_control::NIP_FI_DISCONNECT_CHANNEL
-    }
+/// Channel for signed disconnects of enforced FI sessions in every global mode.
+/// Optional shadow observations remain separate from the real session registry.
+pub fn disconnect_publish_channel(_mode: buzz_auth::NipFiMode) -> &'static str {
+    // Commands apply to enforced sessions independently of global rollout mode.
+    // Optional observations have no entry in the real session registries.
+    buzz_pubsub::conn_control::NIP_FI_DISCONNECT_CHANNEL
 }
 
 /// Channels this pod receives disconnects on.  Shadow also hears enforce's
@@ -393,11 +392,12 @@ pub fn apply_nip_fi_disconnect(
     use buzz_auth::CrossPodMergeResult;
     let merge_result = deny_map.merge_cross_pod_deny(&message.issuer, &pubkey, until, now);
 
-    // Close sessions for all merge outcomes except UnknownIssuer, never in shadow.
+    // Close enforced sessions for all merge outcomes except UnknownIssuer.
     let close_sessions = |reason: &str| {
         if state.config.nip_fi.mode.observes_only() {
-            let sessions = &state.nip_fi_shadow_sessions;
-            return sessions.would_close(&message.issuer, &message.pubkey_bytes);
+            state
+                .nip_fi_shadow_sessions
+                .would_close(&message.issuer, &message.pubkey_bytes);
         }
         let closed = state
             .conn_manager
@@ -412,11 +412,7 @@ pub fn apply_nip_fi_disconnect(
 
     let mode = state.config.nip_fi.mode;
     // What a capacity or poison failsafe does to targeted sessions here.
-    let action = if mode.observes_only() {
-        "would-close recorded (shadow)"
-    } else {
-        "targeted sessions closed"
-    };
+    let action = "targeted enforced sessions closed; optional shadow observations retained";
     match &merge_result {
         CrossPodMergeResult::Merged => {
             close_sessions("merged");
@@ -2160,26 +2156,31 @@ mod route_integration_tests {
 
     #[tokio::test]
     async fn route_disconnect_closes_only_caller_issuer_sessions() {
-        let state = build_test_state(1000).await;
-        let key = nostr::Keys::generate().public_key();
-        let under_a = IssuerSessions::register(&state, TEST_ISS, &key);
-        let under_b = IssuerSessions::register(&state, OTHER_ISS, &key);
+        for mode in [NipFiMode::Enforce, NipFiMode::Shadow] {
+            let mut config = crate::config::Config::for_test();
+            config.nip_fi.mode = mode;
+            config.nip_fi.registry.insert(test_issuer_policy());
+            let state = Arc::new(build_test_app_state(1000, config).await);
+            let key = nostr::Keys::generate().public_key();
+            let under_a = IssuerSessions::register(&state, TEST_ISS, &key);
+            let under_b = IssuerSessions::register(&state, OTHER_ISS, &key);
 
-        let token = mint_token(&key.to_hex(), 300, serde_json::json!({}));
-        let resp = do_request(
-            Arc::clone(&state),
-            "POST",
-            vec![
-                ("Content-Type", "application/json".into()),
-                (CLIENT_ATTACHED_HEADER, format!("Bearer {token}")),
-            ],
-            Some(serde_json::json!({"pubkey": key.to_hex()})),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::OK);
+            let token = mint_token(&key.to_hex(), 300, serde_json::json!({}));
+            let resp = do_request(
+                Arc::clone(&state),
+                "POST",
+                vec![
+                    ("Content-Type", "application/json".into()),
+                    (CLIENT_ATTACHED_HEADER, format!("Bearer {token}")),
+                ],
+                Some(serde_json::json!({"pubkey": key.to_hex()})),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK);
 
-        under_a.assert_closed("issuer A");
-        under_b.assert_open("issuer B");
+            under_a.assert_closed("issuer A");
+            under_b.assert_open("issuer B");
+        }
     }
 
     /// State whose registry and deny map know only issuer A (`TEST_ISS`).
@@ -3793,16 +3794,12 @@ mod route_integration_tests {
             panic!("disconnect subscriber never received the target");
         }
 
-        // Pins finding 1 (disconnect half): a shadow disconnect goes out only
-        // on the shadow channel, so an enforce pod denies and closes nothing.
-        // Other shadow pods receive it and record the deny; no shadow pod
-        // closes a session, whether the command came from shadow or enforce.
-        // Mutation: publishing shadow commands on `NIP_FI_DISCONNECT_CHANNEL`
-        // closes the enforce session; letting a shadow pod close on a
-        // received command fails `assert_open` on the shadow pods.
+        // Global Shadow can host required-community enforced sessions. Commands
+        // must reach real registries on every pod; optional shadow observations
+        // are kept separately and do not represent enforced admissions.
         #[tokio::test]
         #[ignore = "requires Redis"]
-        async fn shadow_disconnect_never_reaches_an_enforce_pod() {
+        async fn shadow_disconnect_reaches_enforced_sessions_on_every_pod() {
             let shadow = pod_in(NipFiMode::Shadow).await;
             let peer = pod_in(NipFiMode::Shadow).await;
             let enforce = pod_in(NipFiMode::Enforce).await;
@@ -3822,22 +3819,25 @@ mod route_integration_tests {
             assert_eq!(status, StatusCode::OK);
             assert_eq!(&body[..], br#"{"disconnected": true}"#);
             assert!(is_denied(&shadow, &key), "shadow records its deny");
-            on_shadow.assert_open("shadow pod");
+            on_shadow.assert_closed("required community on shadow pod");
             drain_publishes(&shadow).await;
             // Anything the enforce pod would hear from that publish has
             // arrived once a later enforce-channel probe has.
             await_probe(&mut enforce_seen, &enforce).await;
-            assert!(!is_denied(&enforce, &key), "enforce records no shadow deny");
-            on_enforce.assert_open("enforce pod");
+            assert!(
+                is_denied(&enforce, &key),
+                "enforce records the command deny"
+            );
+            on_enforce.assert_closed("enforce pod");
             await_target(&mut peer_seen, &key).await;
             assert!(
                 is_denied(&peer, &key),
                 "a second shadow pod records the deny"
             );
-            on_peer.assert_open("second shadow pod");
+            on_peer.assert_closed("required community on second shadow pod");
 
-            // An enforce disconnect reaching a shadow pod records the deny
-            // and closes nothing there.
+            // An enforce disconnect also closes required-community sessions
+            // on a globally Shadow pod; optional observations stay separate.
             let target = nostr::Keys::generate().public_key();
             let target_on_shadow = IssuerSessions::register(&shadow, TEST_ISS, &target);
             let token = mint_token(&target.to_hex(), 300, serde_json::json!({}));
@@ -3846,7 +3846,7 @@ mod route_integration_tests {
             drain_publishes(&enforce).await;
             await_target(&mut shadow_seen, &target).await;
             assert!(is_denied(&shadow, &target), "shadow records enforce's deny");
-            target_on_shadow.assert_open("shadow pod, enforce command");
+            target_on_shadow.assert_closed("required community on shadow pod, enforce command");
         }
 
         // Pins finding 1 (replay half): shadow and enforce share one Redis

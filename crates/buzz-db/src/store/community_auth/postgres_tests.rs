@@ -38,7 +38,7 @@ async fn accepted(db: &Db, request: &UpgradeRequest) -> UpgradeRecord {
     else {
         panic!("acceptance refused")
     };
-    record
+    *record
 }
 
 async fn policy(db: &Db, request: &UpgradeRequest) -> CommunityAuthPolicy {
@@ -512,4 +512,265 @@ async fn host_policy_tracks_primary_requirement_and_serving_lifecycle() {
         .await
         .unwrap()
         .is_none());
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn activation_exact_ack_baseline_invalidation_and_restart_journey() {
+    let (db, request, _) = fixture().await;
+    let boot = Uuid::new_v4();
+    assert!(db
+        .register_auth_boot(boot, "test-image")
+        .await
+        .unwrap()
+        .is_empty());
+    let record = accepted(&db, &request).await;
+    let generation = record.policy_generation;
+    let targets = db.auth_activation_targets(boot).await.unwrap();
+    assert_eq!(targets.len(), 1);
+    assert_eq!(targets[0].operation_id, request.operation_id);
+    let ack = DrainAck::new(boot, request.operation_id, generation);
+    for wrong in [
+        DrainAck::new(Uuid::new_v4(), request.operation_id, generation),
+        DrainAck::new(boot, Uuid::new_v4(), generation),
+        DrainAck::new(boot, request.operation_id, generation + 1),
+    ] {
+        assert!(!db.acknowledge_auth_drain(wrong).await.unwrap());
+    }
+    // A replacement can apply its own state, but cannot discharge a paused or
+    // unreachable original boot, even if the replacement then self-retires.
+    let replacement = Uuid::new_v4();
+    db.register_auth_boot(replacement, "replacement-while-original-paused")
+        .await
+        .unwrap();
+    assert!(db
+        .acknowledge_auth_drain(DrainAck::new(replacement, request.operation_id, generation))
+        .await
+        .unwrap());
+    assert!(db.retire_auth_boot(replacement).await.unwrap());
+    let held = db
+        .community_auth_upgrade_status(request.operation_id, &request.operator_pubkey)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(held
+        .pending_reasons
+        .iter()
+        .any(|reason| reason == "boot_drain_pending"));
+    // Resuming the original boot must still ACK its exact incarnation.
+    assert!(db.acknowledge_auth_drain(ack).await.unwrap());
+    let status = db
+        .community_auth_upgrade_status(request.operation_id, &request.operator_pubkey)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status.state, "pending");
+    assert_eq!(status.pending_reasons, ["registry_baseline_unverified"]);
+    let satisfied: bool = sqlx::query_scalar("SELECT satisfied_at IS NOT NULL FROM community_auth_obligations WHERE operation_id=$1 AND boot_id=$2 AND policy_generation=$3")
+        .bind(request.operation_id).bind(boot).bind(generation).fetch_one(db.pool()).await.unwrap();
+    assert!(satisfied);
+    super::activation::verify_baseline_for_test(&db).await;
+    assert!(db.acknowledge_auth_drain(ack).await.unwrap());
+    let active = db
+        .community_auth_upgrade_status(request.operation_id, &request.operator_pubkey)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(active.state, "active");
+    assert!(active.activated_at.is_some());
+    assert!(active.pending_reasons.is_empty());
+    assert_eq!(active.activation_history.as_array().unwrap().len(), 1);
+    assert_eq!(active.activation_history[0]["baseline"]["test_only"], true);
+    // A new incarnation cannot reuse the old boot identity. A new registration
+    // joins existing operations before it can serve, temporarily pending again.
+    assert!(db.register_auth_boot(boot, "replacement").await.is_err());
+    let restart = Uuid::new_v4();
+    assert_eq!(
+        db.register_auth_boot(restart, "replacement")
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    let pending = db
+        .community_auth_upgrade_status(request.operation_id, &request.operator_pubkey)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(pending.state, "pending");
+    assert_eq!(pending.pending_reasons, ["boot_drain_pending"]);
+    assert!(db.retire_auth_boot(restart).await.unwrap());
+    assert!(!db
+        .acknowledge_auth_drain(DrainAck::new(restart, request.operation_id, generation))
+        .await
+        .unwrap());
+    assert!(db
+        .register_auth_boot(restart, "cannot-resume")
+        .await
+        .is_err());
+    assert_eq!(
+        db.community_auth_upgrade_status(request.operation_id, &request.operator_pubkey)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        "active"
+    );
+    db.invalidate_auth_baseline().await.unwrap();
+    let invalidated = db
+        .community_auth_upgrade_status(request.operation_id, &request.operator_pubkey)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(invalidated.state, "pending");
+    assert_eq!(invalidated.activated_at, active.activated_at);
+    assert_eq!(invalidated.activation_epoch, active.activation_epoch);
+    assert_eq!(invalidated.activation_history, active.activation_history);
+    // Revalidation records a new epoch without erasing the earlier proof.
+    super::activation::verify_baseline_for_test(&db).await;
+    assert!(db.acknowledge_auth_drain(ack).await.unwrap());
+    let reactivated = db
+        .community_auth_upgrade_status(request.operation_id, &request.operator_pubkey)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(reactivated.state, "active");
+    assert_eq!(reactivated.activated_at, active.activated_at);
+    assert_eq!(reactivated.activation_history.as_array().unwrap().len(), 2);
+    // Lifecycle ineligibility outranks a missing baseline.
+    sqlx::query("UPDATE communities SET archived_at=now() WHERE id=$1")
+        .bind(request.community_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        db.community_auth_upgrade_status(request.operation_id, &request.operator_pubkey)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        "unavailable"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn activation_registration_and_lifecycle_lock_order_journey() {
+    // Both registration orders must capture the same serving participants.
+    let (db, request, _) = fixture().await;
+    let boot = Uuid::new_v4();
+    let (registration, enabled) = tokio::join!(
+        db.register_auth_boot(boot, "racing-boot"),
+        db.enable_community_nip_fi(&request, Ok(()))
+    );
+    registration.unwrap();
+    let UpgradeOutcome::Accepted(record) = enabled.unwrap() else {
+        panic!("enable");
+    };
+    let obligations: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM community_auth_obligations WHERE operation_id=$1 AND boot_id=$2",
+    )
+    .bind(record.operation_id)
+    .bind(boot)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(obligations, 1);
+    super::activation::verify_baseline_for_test(&db).await;
+    let ack = DrainAck::new(boot, record.operation_id, record.policy_generation);
+    let (acked, invalidated) = tokio::join!(
+        db.acknowledge_auth_drain(ack),
+        db.invalidate_auth_baseline()
+    );
+    assert!(acked.unwrap());
+    invalidated.unwrap();
+    assert_eq!(
+        db.community_auth_upgrade_status(record.operation_id, &request.operator_pubkey)
+            .await
+            .unwrap()
+            .unwrap()
+            .pending_reasons,
+        ["registry_baseline_unverified"]
+    );
+
+    // Exercise the actual opposing lifecycle methods against both enable and
+    // completion. A cycle fails via the SQL lock bound or the outer deadline.
+    for lifecycle in ["archive", "delete", "transfer"] {
+        for completing in [false, true] {
+            let (db, request, keys) = fixture().await;
+            let boot = Uuid::new_v4();
+            db.register_auth_boot(boot, "lifecycle-race").await.unwrap();
+            let record = if completing {
+                Some(accepted(&db, &request).await)
+            } else {
+                None
+            };
+            let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+            let auth = async {
+                barrier.wait().await;
+                if let Some(record) = record {
+                    db.acknowledge_auth_drain(DrainAck::new(
+                        boot,
+                        record.operation_id,
+                        record.policy_generation,
+                    ))
+                    .await
+                    .unwrap();
+                } else {
+                    db.enable_community_nip_fi(&request, Ok(())).await.unwrap();
+                }
+            };
+            let mutation = async {
+                barrier.wait().await;
+                match lifecycle {
+                    "archive" => {
+                        db.archive_community_owned_by(
+                            &request.expected_host,
+                            &request.expected_owner_pubkey,
+                            "deployment.example",
+                        )
+                        .await
+                        .unwrap();
+                    }
+                    "delete" => {
+                        db.deletion_store()
+                            .submit(
+                                Some(&request.expected_host),
+                                "operator",
+                                None,
+                                Some(CommunityId::from_uuid(request.community_id)),
+                            )
+                            .await
+                            .unwrap();
+                    }
+                    _ => {
+                        let _ = db
+                            .transfer_ownership(
+                                CommunityId::from_uuid(request.community_id),
+                                &Keys::generate().public_key().to_hex(),
+                                &request.expected_owner_pubkey,
+                                &keys,
+                            )
+                            .await
+                            .unwrap();
+                    }
+                }
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(15), async {
+                tokio::join!(auth, mutation);
+            })
+            .await
+            .unwrap();
+            if lifecycle != "transfer" {
+                if let Some(status) = db
+                    .community_auth_upgrade_status(request.operation_id, &request.operator_pubkey)
+                    .await
+                    .unwrap()
+                {
+                    assert_eq!(status.state, "unavailable");
+                    assert!(status.pending_reasons.is_empty());
+                }
+            }
+        }
+    }
 }

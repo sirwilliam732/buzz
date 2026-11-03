@@ -2344,6 +2344,16 @@ async fn serve(
         hard_shutdown_abort
     });
 
+    // Registration precedes public listener binding. With no trusted production
+    // baseline verifier this is dark tracking; failure cannot assert completion.
+    let _auth_activation = match state.start_auth_activation().await {
+        Ok(task) => Some(task),
+        Err(error) => {
+            tracing::warn!(%error, "auth activation tracking unavailable; completion disabled");
+            None
+        }
+    };
+
     let step = StepTimer::start(StartupStep::ListenerBind);
     let tcp_listener = tokio::net::TcpListener::bind(&config.bind_addr)
         .await
@@ -2402,6 +2412,9 @@ async fn serve(
             if let Err(e) = h.await {
                 tracing::warn!(error = %e, "NIP-FI: JWKS refresh supervisor join error on shutdown");
             }
+        }
+        if let Err(error) = state.retire_auth_activation().await {
+            tracing::warn!(%error,"activation retirement remains pending");
         }
         hard_shutdown.abort();
         return Ok(());

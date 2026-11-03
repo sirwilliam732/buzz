@@ -17,9 +17,15 @@ use dashmap::DashMap;
 /// Coalesces refresh requests per key. The map holds only keys with a
 /// refresh in flight; the value is "another request arrived since it began".
 pub struct CoalescedRefresh<K> {
-    pending: DashMap<K, bool>,
+    pending: DashMap<K, Pending>,
     min_interval: Duration,
     run_timeout: Duration,
+}
+
+#[derive(Default)]
+struct Pending {
+    rerun: bool,
+    work: Vec<crate::auth_activation::WorkTicket>,
 }
 
 impl<K> CoalescedRefresh<K>
@@ -44,13 +50,18 @@ where
         F: Fn() -> Fut + Send + 'static,
         Fut: Future<Output = ()> + Send,
     {
+        let work = crate::auth_activation::current_ticket();
         match self.pending.entry(key.clone()) {
             Entry::Occupied(mut rerun) => {
-                *rerun.get_mut() = true;
+                rerun.get_mut().rerun = true;
+                rerun.get_mut().work.extend(work);
                 return;
             }
             Entry::Vacant(slot) => {
-                slot.insert(false);
+                slot.insert(Pending {
+                    rerun: false,
+                    work: Vec::new(),
+                });
             }
         }
         // Frees the key if the task panics or is cancelled, including before
@@ -59,21 +70,35 @@ where
             owner: Arc::clone(self),
             key: Some(key.clone()),
         };
+        // Each run owns only the callers it covers, so valid new-generation
+        // refreshes cannot extend an older generation's drain indefinitely.
+        let mut work: Vec<_> = work.into_iter().collect();
         tokio::spawn(async move {
             let this = Arc::clone(&release.owner);
             loop {
-                if tokio::time::timeout(this.run_timeout, refresh())
-                    .await
-                    .is_err()
-                {
+                let future = refresh();
+                let run = async {
+                    match work.first() {
+                        Some(ticket) => {
+                            crate::auth_activation::with_ticket(ticket.clone(), future).await
+                        }
+                        None => future.await,
+                    }
+                };
+                if tokio::time::timeout(this.run_timeout, run).await.is_err() {
+                    for ticket in &work {
+                        ticket.cleanup_unproven();
+                    }
                     tracing::warn!(
                         timeout_ms = this.run_timeout.as_millis() as u64,
                         "coalesced refresh timed out"
                     );
                 }
+                drop(work);
                 tokio::time::sleep(this.min_interval).await;
-                if !this.rerun_or_release(&key) {
-                    break;
+                match this.rerun_or_release(&key) {
+                    Some(next) => work = next,
+                    None => break,
                 }
             }
             // Finished normally: rerun_or_release already freed the key.
@@ -84,17 +109,17 @@ where
     /// Clear the rerun flag and report it, or free the key when no request
     /// arrived. Atomic with [`Self::request`]'s entry check, so a request
     /// either sets the flag before this reads it or finds the key free.
-    fn rerun_or_release(&self, key: &K) -> bool {
+    fn rerun_or_release(&self, key: &K) -> Option<Vec<crate::auth_activation::WorkTicket>> {
         match self.pending.entry(key.clone()) {
-            Entry::Occupied(mut entry) if *entry.get() => {
-                *entry.get_mut() = false;
-                true
+            Entry::Occupied(mut entry) if entry.get().rerun => {
+                entry.get_mut().rerun = false;
+                Some(std::mem::take(&mut entry.get_mut().work))
             }
             Entry::Occupied(entry) => {
                 entry.remove();
-                false
+                None
             }
-            Entry::Vacant(_) => false,
+            Entry::Vacant(_) => None,
         }
     }
 }
@@ -235,6 +260,36 @@ mod tests {
             refresh.pending.is_empty(),
             "an unpolled task must not wedge the key"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn compliant_trailing_refresh_does_not_keep_old_generation_pending() {
+        use crate::auth_activation::{with_ticket, WorkTracker};
+        let tracker = Arc::new(WorkTracker::default());
+        let refresh = Arc::new(CoalescedRefresh::new(INTERVAL, TIMEOUT));
+        let runs = Arc::new(AtomicUsize::new(0));
+        let old = tracker.enter("community", 0).unwrap();
+        with_ticket(old.clone(), async {
+            refresh.request("root", counting(&runs));
+        })
+        .await;
+        settle().await;
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        tracker.require("community", 1);
+        let new = tracker.enter("community", 1).unwrap();
+        with_ticket(new, async {
+            refresh.request("root", counting(&runs));
+        })
+        .await;
+        drop(old);
+        assert!(
+            tracker.is_drained("community", 1),
+            "old run exited despite a trailing compliant refresh"
+        );
+        tokio::time::advance(INTERVAL).await;
+        settle().await;
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
+        assert!(tracker.is_drained("community", 1));
     }
 
     #[tokio::test(start_paused = true)]

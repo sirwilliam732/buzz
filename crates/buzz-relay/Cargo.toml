@@ -16,6 +16,8 @@ name = "buzz-relay"
 path = "src/main.rs"
 
 [dependencies]
+http-body = "1"
+http-body-util = "0.1"
 buzz-core = { workspace = true }
 buzz-conformance = { workspace = true }
 buzz-db = { workspace = true }
@@ -102,8 +104,6 @@ ring = "0.17"
 # `use_pem` enables EncodingKey::from_ec_pem for minting ES256 test assertions
 # in settings_tests.rs (key-pairing build_router tests).
 jsonwebtoken = { version = "10.4.0", default-features = false, features = ["aws_lc_rs", "use_pem"] }
-http-body = "1"
-http-body-util = "0.1"
 buzz-core = { workspace = true, features = ["test-utils"] }
 buzz-auth = { workspace = true, features = ["dev", "test-utils"] }
 reqwest = { workspace = true }

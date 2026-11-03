@@ -11,6 +11,9 @@ use uuid::Uuid;
 
 use crate::{Db, Result};
 
+mod activation;
+pub use activation::{ActivationTarget, DrainAck};
+
 /// Canonical request tuple, with the authenticated operator added by the relay.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpgradeRequest {
@@ -56,6 +59,12 @@ pub struct UpgradeRecord {
     pub state: String,
     /// Extensible activation obligations; unknown reasons must remain pending.
     pub pending_reasons: Vec<String>,
+    /// Historical first activation, retained even if current evidence invalidates.
+    pub activated_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Epoch associated with the activation evidence, not current eligibility.
+    pub activation_epoch: Option<i64>,
+    /// Append-only per-epoch activation evidence, retained across invalidation.
+    pub activation_history: serde_json::Value,
 }
 
 impl UpgradeRecord {
@@ -74,7 +83,7 @@ impl UpgradeRecord {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpgradeOutcome {
     /// Committed or recovered acceptance, including current target state.
-    Accepted(UpgradeRecord),
+    Accepted(Box<UpgradeRecord>),
     /// Stable machine-readable precondition failure.
     Refused(&'static str),
 }
@@ -93,7 +102,7 @@ pub struct CommunityAuthPolicy {
 
 // One statement gives status a single primary-database snapshot. Missing trust,
 // host/policy drift and terminal lifecycle never become a usable active result.
-const RECEIPT: &str = "SELECT u.*, true AS requires_nip_fi,
+const RECEIPT: &str = "SELECT receipt.*, CASE WHEN state='pending' THEN raw_pending_reasons ELSE ARRAY[]::text[] END AS pending_reasons FROM (SELECT u.*, true AS requires_nip_fi,
     CASE WHEN c.id IS NOT NULL AND c.host = u.expected_host
         AND c.archived_at IS NULL AND c.deleted_at IS NULL
         AND c.deletion_state = 'active' AND c.requires_nip_fi
@@ -102,11 +111,15 @@ const RECEIPT: &str = "SELECT u.*, true AS requires_nip_fi,
             WHERE d.community_id = c.id AND d.stage <> 'aborted')
         AND EXISTS (SELECT 1 FROM community_nip_fi_issuers i
             WHERE i.community_id = c.id AND i.issuer = u.expected_issuer)
-    THEN 'pending' ELSE 'unavailable' END AS state,
-    ARRAY['registry_baseline_unverified']::text[] AS pending_reasons
+    THEN CASE WHEN $2 AND b.verified AND u.activation_epoch=b.epoch AND u.activated_at IS NOT NULL
+        AND NOT EXISTS(SELECT 1 FROM community_auth_obligations o WHERE o.operation_id=u.operation_id AND o.satisfied_at IS NULL)
+        THEN 'active' ELSE 'pending' END ELSE 'unavailable' END AS state,
+    array_remove(ARRAY[CASE WHEN NOT $2 OR b.verified IS DISTINCT FROM true THEN 'registry_baseline_unverified' END,
+        CASE WHEN EXISTS(SELECT 1 FROM community_auth_obligations o WHERE o.operation_id=u.operation_id AND o.satisfied_at IS NULL) THEN 'boot_drain_pending' END], NULL)::text[] AS raw_pending_reasons
     FROM community_auth_upgrades u
     LEFT JOIN communities c ON c.id = u.target_community_id
-    WHERE u.operation_id = $1";
+    LEFT JOIN community_auth_baseline b ON b.singleton
+    WHERE u.operation_id = $1) receipt";
 
 impl Db {
     /// Bind a serving host and its authentication policy from one writer row.
@@ -190,6 +203,7 @@ impl Db {
         .await?;
         let record: Option<UpgradeRecord> = sqlx::query_as(RECEIPT)
             .bind(operation)
+            .bind(cfg!(test))
             .fetch_optional(&mut *connection)
             .await?;
         Ok(record.filter(|record| record.operator_pubkey == operator))
@@ -215,6 +229,7 @@ impl Db {
         sqlx::query("SET LOCAL lock_timeout = '5s'")
             .execute(&mut *tx)
             .await?;
+        activation::lock(&mut tx).await?;
         // Lock UUID first across all targets, so cross-community UUID reuse
         // cannot race the INSERT. Hash collisions merely serialize callers.
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 510))")
@@ -223,11 +238,12 @@ impl Db {
             .await?;
         let existing: Option<UpgradeRecord> = sqlx::query_as(RECEIPT)
             .bind(request.operation_id)
+            .bind(cfg!(test))
             .fetch_optional(&mut *tx)
             .await?;
         if let Some(record) = existing {
             return Ok(if record.matches(request) {
-                UpgradeOutcome::Accepted(record)
+                UpgradeOutcome::Accepted(Box::new(record))
             } else {
                 UpgradeOutcome::Refused("idempotency_conflict")
             });
@@ -309,12 +325,14 @@ impl Db {
         .bind(generation)
         .execute(&mut *tx)
         .await?;
+        activation::snapshot(&mut tx, request.operation_id, generation).await?;
         let record = sqlx::query_as(RECEIPT)
             .bind(request.operation_id)
+            .bind(cfg!(test))
             .fetch_one(&mut *tx)
             .await?;
         tx.commit().await?;
-        Ok(UpgradeOutcome::Accepted(record))
+        Ok(UpgradeOutcome::Accepted(Box::new(record)))
     }
 }
 

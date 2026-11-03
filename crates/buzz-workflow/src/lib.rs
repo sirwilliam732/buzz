@@ -375,6 +375,24 @@ impl WorkflowEngine {
         community_id: CommunityId,
         event: &buzz_core::StoredEvent,
     ) -> Result<(), WorkflowError> {
+        self.on_event_with_spawner(community_id, event, |task| {
+            tokio::spawn(task);
+        })
+        .await
+    }
+
+    /// Dispatch event-triggered runs through a caller-owned spawn boundary.
+    /// The relay uses this to retain admission/effect ownership through each
+    /// detached run and its output; schedule-triggered runs remain independent.
+    pub async fn on_event_with_spawner<S>(
+        self: &Arc<Self>,
+        community_id: CommunityId,
+        event: &buzz_core::StoredEvent,
+        spawn: S,
+    ) -> Result<(), WorkflowError>
+    where
+        S: Fn(std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>),
+    {
         let Some(channel_id) = event.channel_id else {
             tracing::debug!(
                 event_id = %event.event.id.to_hex(),
@@ -479,14 +497,14 @@ impl WorkflowEngine {
             let def_clone = def.clone();
             let ctx_clone = trigger_ctx.clone();
 
-            tokio::spawn(async move {
+            spawn(Box::pin(async move {
                 let result =
                     executor::execute_run(&engine, community_id, run_id, &def_clone, &ctx_clone)
                         .await;
                 engine
                     .finalize_run(community_id, run_id, result, None)
                     .await;
-            });
+            }));
         }
 
         Ok(())

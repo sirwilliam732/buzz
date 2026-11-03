@@ -947,7 +947,7 @@ async fn handle_workflow_trigger(
     let db = state.db.clone();
     let def_value = workflow.definition.clone();
     let trigger_ctx_clone = trigger_ctx.clone();
-    tokio::spawn(async move {
+    crate::auth_activation::spawn(async move {
         let def: buzz_workflow::WorkflowDef = match serde_json::from_value(def_value) {
             Ok(d) => d,
             Err(e) => {
@@ -1125,7 +1125,7 @@ async fn handle_approval_grant(
     let engine = Arc::clone(&state.workflow_engine);
     let db = state.db.clone();
 
-    tokio::spawn(async move {
+    crate::auth_activation::spawn(async move {
         resume_workflow_after_approval(engine, db, community_id, run_id, workflow_id, resume_index)
             .await;
     });
@@ -1234,7 +1234,7 @@ async fn handle_approval_deny(
     let pubkey_hex = self_hex.clone();
     let db = state.db.clone();
 
-    tokio::spawn(async move {
+    crate::auth_activation::spawn(async move {
         let run = match db.get_workflow_run(community_id, run_id).await {
             Ok(r) => r,
             Err(e) => {

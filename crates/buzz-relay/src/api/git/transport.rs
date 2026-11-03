@@ -1533,7 +1533,7 @@ async fn run_git_at(
     // Stream request body to git stdin.
     let mut stdin = child.stdin.take().unwrap();
     let pump_service = service.to_string();
-    let body_task = tokio::spawn(async move {
+    let body_task = crate::auth_activation::spawn(async move {
         use futures_util::StreamExt;
         let mut stream = body.into_data_stream();
         while let Some(chunk) = stream.next().await {
@@ -1569,6 +1569,12 @@ async fn run_git_at(
     let status = match timeout_result {
         Err(_elapsed) => {
             body_abort.abort();
+            if let Err(error) = child.kill().await {
+                if let Some(work) = crate::auth_activation::current_ticket() {
+                    work.cleanup_unproven();
+                }
+                warn!(%error, "timed-out git subprocess could not be reaped");
+            }
             warn!(service = %service, timeout_secs = PACK_OPS_TIMEOUT.as_secs(), "git subprocess timed out");
             return Err((StatusCode::GATEWAY_TIMEOUT, "git operation timed out").into_response());
         }
@@ -1763,14 +1769,16 @@ struct StreamingGit {
     /// Held purely to extend lifetime. `kill_on_drop(true)` means dropping
     /// this after the stream completes reaps any lingering process; on the
     /// happy path the child has already exited by then.
-    child: tokio::process::Child,
+    child: Option<tokio::process::Child>,
     /// The ephemeral bare repo the subprocess reads objects from. Must not be
     /// removed from disk until the subprocess is done — i.e. until the stream
     /// ends.
-    _repo: HydratedRepo,
+    repo: Option<HydratedRepo>,
+    /// Keep generation ownership until the cleanup task has reaped the child.
+    work: Option<crate::auth_activation::WorkTicket>,
     /// Pumping the request body is detached from response polling. Abort it
     /// when the response is dropped or the subprocess times out.
-    stdin_task: tokio::task::JoinHandle<()>,
+    stdin_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 /// Adds a hard deadline and lifecycle metrics to upload-pack stdout.
@@ -1821,9 +1829,13 @@ impl futures_util::Stream for StreamingGit {
             std::task::Poll::Ready(Some(Err(error)))
                 if error.kind() == std::io::ErrorKind::TimedOut
         ) {
-            self.stdin_task.abort();
-            if let Err(error) = self.child.start_kill() {
-                warn!(error = %error, "timed-out git upload-pack could not be killed");
+            if let Some(task) = &self.stdin_task {
+                task.abort();
+            }
+            if let Some(child) = &mut self.child {
+                if let Err(error) = child.start_kill() {
+                    warn!(error = %error, "timed-out git upload-pack could not be killed");
+                }
             }
         }
         poll
@@ -1890,7 +1902,32 @@ impl<S> Drop for TimedByteStream<S> {
 
 impl Drop for StreamingGit {
     fn drop(&mut self) {
-        self.stdin_task.abort();
+        let stdin_task = self.stdin_task.take();
+        if let Some(task) = &stdin_task {
+            task.abort();
+        }
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        let repo = self.repo.take();
+        let work = self.work.take();
+        let _ = child.start_kill();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                // Retain both workspace and generation ownership through wait.
+                let _work = work;
+                let _repo = repo;
+                if let Some(task) = stdin_task {
+                    let _ = task.await;
+                }
+                if let Err(error) = child.wait().await {
+                    if let Some(work) = &_work {
+                        work.cleanup_unproven();
+                    }
+                    warn!(%error, "git streaming subprocess reap failed");
+                }
+            });
+        }
     }
 }
 
@@ -1939,7 +1976,7 @@ fn stream_git_read(
     // Pump the request body into git's stdin, then close it (EOF). Detached:
     // the task ends on its own when the body ends or the write fails.
     let mut stdin = child.stdin.take().expect("stdin piped");
-    let stdin_task = tokio::spawn(async move {
+    let stdin_task = crate::auth_activation::spawn(async move {
         use futures_util::StreamExt;
         let mut stream = body.into_data_stream();
         while let Some(chunk) = stream.next().await {
@@ -1968,9 +2005,10 @@ fn stream_git_read(
     let stdout = child.stdout.take().expect("stdout piped");
     let git_stream = StreamingGit {
         inner: TimedByteStream::new(tokio_util::io::ReaderStream::new(stdout), PACK_OPS_TIMEOUT),
-        child,
-        _repo: repo,
-        stdin_task,
+        child: Some(child),
+        repo: Some(repo),
+        work: crate::auth_activation::current_ticket(),
+        stdin_task: Some(stdin_task),
     };
 
     // Prepend any protocol header (info/refs) ahead of git's stdout. The

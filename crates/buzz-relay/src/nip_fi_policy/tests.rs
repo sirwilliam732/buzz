@@ -34,7 +34,7 @@ impl PolicySource for Source {
             }
             let required = host == "required.example" && self.required.load(Ordering::SeqCst);
             Ok(Some(CommunityAuthPolicy {
-                community_id: uuid::Uuid::nil(),
+                community_id: uuid::Uuid::from_u128(if host == "required.example" { 1 } else { 2 }),
                 requires_nip_fi: required,
                 policy_generation: i64::from(required),
             }))
@@ -412,6 +412,7 @@ async fn unmapped_legacy_rejection_scope_never_yields_an_admission_proof() {
     let (state, _, key, _) = fixture(NipFiMode::Off).await;
     let policy = Policy {
         community_id: uuid::Uuid::nil(),
+        generation: 0,
         mode: NipFiMode::Off,
         required: false,
         stored_required: false,

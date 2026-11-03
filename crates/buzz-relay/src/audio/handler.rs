@@ -132,11 +132,11 @@ pub async fn ws_audio_handler(
         .get(axum::http::header::HOST)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    let (tenant, bound_mode) = match crate::nip_fi_policy::bind_for_upgrade(&state, raw_host).await
-    {
-        Ok(binding) => binding,
-        Err(response) => return response,
-    };
+    let (tenant, bound_mode, admitted_generation) =
+        match crate::nip_fi_policy::bind_for_upgrade(&state, raw_host).await {
+            Ok(binding) => binding,
+            Err(response) => return response,
+        };
     if bound_mode.restricts() && (nip_fi_assertion.is_none() || bound_mode.denies_unconditionally())
     {
         match crate::nip_fi_upgrade::check_nip_fi_at_upgrade(
@@ -216,19 +216,34 @@ pub async fn ws_audio_handler(
             connection_time,
         )
     });
-    limit_audio_websocket(ws).on_upgrade(move |socket| {
-        handle_audio_connection(
-            socket,
-            state,
-            tenant,
-            channel_id,
-            permit,
-            nip_fi_assertion,
-            shadow,
-            shadow_line,
-            connection_time,
-            client_ip,
+    limit_audio_websocket(ws).on_upgrade(move |socket| async move {
+        let Some(ticket) = state.auth_activation.enter(
+            &tenant.community().as_uuid().to_string(),
+            admitted_generation,
+        ) else {
+            return;
+        };
+        if let Some(assertion) = &nip_fi_assertion {
+            if !ticket.enforce_issuer(assertion.identity().issuer()) {
+                return;
+            }
+        }
+        crate::auth_activation::with_ticket(
+            ticket,
+            handle_audio_connection(
+                socket,
+                state,
+                tenant,
+                channel_id,
+                permit,
+                nip_fi_assertion,
+                shadow,
+                shadow_line,
+                connection_time,
+                client_ip,
+            ),
         )
+        .await
     })
 }
 
@@ -281,6 +296,7 @@ pub(crate) async fn handle_audio_connection(
     client_ip: Option<std::net::IpAddr>,
 ) {
     let cancel = CancellationToken::new();
+    let _activation_cancel = crate::auth_activation::link_cancel(cancel.clone());
 
     // Fix 3: Arm the NIP-FI session gate and expiry task BEFORE the
     // `is_community_active` bootstrap await so the session deadline is
@@ -548,7 +564,7 @@ fn hand_off_socket(
     // The task is spawned before the read half moves out of `ws_recv`, so
     // `ws_recv` is never left without one of its two states.
     let (recv_tx, recv_rx) = tokio::sync::oneshot::channel();
-    let close = tokio::spawn(async move {
+    let close = crate::auth_activation::spawn(async move {
         if let Ok(recv) = recv_rx.await {
             crate::connection::await_client_close(recv).await;
         }
@@ -2346,6 +2362,7 @@ async fn run_active_audio_connection(
     if let Some(expiry_task) = nip_fi_audio_expiry_task {
         let _ = expiry_task.await;
     }
+    audio_gate.fence().await;
     // Atomic owner remove + end check: remove_peer_and_check_ended holds the
     // AdmissionGuard lock across index recycling AND the is_empty + ended=true
     // check. Ingress mirrors never archive authoritative huddle state; they

@@ -56,6 +56,9 @@ pub fn parse_cache_invalidation_channel(channel: &str) -> Option<CommunityId> {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "op")]
 pub enum CacheInvalidation {
+    /// Drop the activation worker's policy snapshot and re-read durable state.
+    /// This is a wake hint only; it never carries a floor or cancels a socket.
+    CommunityAuthPolicy,
     /// Drop the `(channel_id, pubkey)` membership entry and the user's
     /// accessible-channels entry. Mirrors `invalidate_membership`.
     Membership {
@@ -235,6 +238,7 @@ mod tests {
     #[test]
     fn unit_variants_roundtrip_through_json() {
         for msg in [
+            CacheInvalidation::CommunityAuthPolicy,
             CacheInvalidation::AccessibleAll,
             CacheInvalidation::ChannelDeleted,
             CacheInvalidation::Visibility {

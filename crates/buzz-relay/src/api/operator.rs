@@ -1236,6 +1236,7 @@ fn upgrade_response(
     use axum::response::IntoResponse;
     if upgrade_configured_trust(state, &record.expected_host, &record.expected_issuer).is_err() {
         record.state = "unavailable".to_owned();
+        record.pending_reasons.clear();
     }
     Json(record).into_response()
 }
@@ -1307,7 +1308,11 @@ pub async fn enable_community_nip_fi(
         })?;
     match outcome {
         buzz_db::community_auth::UpgradeOutcome::Accepted(record) => {
-            Ok(upgrade_response(&state, record))
+            state.invalidate_community_auth_policy(&buzz_core::TenantContext::resolved(
+                buzz_core::CommunityId::from_uuid(record.community_id),
+                record.expected_host.clone(),
+            ));
+            Ok(upgrade_response(&state, *record))
         }
         buzz_db::community_auth::UpgradeOutcome::Refused(code) => {
             let status = match code {

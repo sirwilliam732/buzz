@@ -237,6 +237,12 @@ run_unit_tests() {
   run_test_step "buzz-relay audio handler tests" \
     cargo test -p buzz-relay --lib audio::handler::tests:: -- --nocapture
 
+  run_test_step "buzz-pubsub policy hint payload tests" \
+    cargo test -p buzz-pubsub --lib cache_invalidation::tests:: -- --nocapture
+
+  run_test_step "buzz-relay activation ownership tests" \
+    cargo test -p buzz-relay --lib auth_activation:: -- --nocapture
+
   run_test_step "buzz-relay NIP-FI gate tests" \
     cargo test -p buzz-relay --lib nip_fi_gate::tests:: -- --nocapture
 

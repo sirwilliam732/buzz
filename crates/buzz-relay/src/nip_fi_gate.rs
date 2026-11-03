@@ -165,6 +165,14 @@ impl SessionAdmissionGate {
         self.cancel.is_cancelled() || self.deadline_passed()
     }
 
+    /// Close admission and await all existing effect permits, including off-mode.
+    /// This is policy fencing, not lease expiry: it emits no denial or metric.
+    pub(crate) async fn fence(&self) {
+        self.cancel.cancel();
+        let mut phase = self.phase.write().await;
+        *phase = SessionPhase::Expired;
+    }
+
     /// Expire the session.
     ///
     /// Ordering (per contract):
@@ -352,5 +360,18 @@ mod tests {
             gate.is_expired_or_past_deadline(),
             "cancelled gate must report expired"
         );
+    }
+    #[tokio::test]
+    async fn off_mode_fence_cancels_before_waiting_for_effect_and_prevents_reentry() {
+        let cancel = CancellationToken::new();
+        let gate = SessionAdmissionGate::off_mode(cancel.clone());
+        let effect = gate.acquire_effect().await.unwrap();
+        let fence = gate.fence();
+        tokio::pin!(fence);
+        assert!(futures_util::poll!(&mut fence).is_pending());
+        assert!(cancel.is_cancelled());
+        drop(effect);
+        fence.await;
+        assert!(gate.acquire_effect().await.is_err());
     }
 }

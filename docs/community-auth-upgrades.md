@@ -273,7 +273,81 @@ drain or deployment is prescribed here. Existing receipt recovery remains usable
 while new acceptances are disabled.
 
 Required sessions admitted under global Shadow are real enforced FI sessions.
-The existing global-Shadow admin disconnect path still only observes would-close;
-BUZZ-512 must close these enforced sessions independently of global rollout mode,
+BUZZ-512 closes these enforced sessions independently of global rollout mode,
 while preserving the separate optional-shadow registry. Do not enable production
-upgrades until this activation/control gap is verified closed.
+upgrades until the activation/control behavior and baseline authority are verified.
+
+## Activation tracking (BUZZ-512 draft)
+
+Policy acceptance and completed enforcement are different states. The relay
+registers a fresh boot UUID on its writer primary before public listener binding.
+Enable captures every non-retired registered boot under the same new two-integer
+advisory lock (`0x42554155`, `0`). All routes in the coordination scope must use
+that primary, including canaries and other regions. Another primary cannot join
+this scope. The initial implementation uses the entire writer database as its
+scope rather than a Kubernetes Deployment name.
+
+A five-second durable reconciliation installs sticky community-generation floors.
+The tracker keys work by immutable community ID, so a reused host does not inherit
+another community's floor. Reconciliation
+cancels older work, and retries exact boot/operation/generation acknowledgements.
+The existing cluster cache-invalidation bus carries a policy-snapshot wake hint.
+Receivers re-read the writer; hints contain no authority and never cancel sockets
+directly. Lost hints fall back to the five-second poll and cannot discharge an obligation.
+Delayed policy reads cannot overwrite an installed floor. New valid FI work at
+the required generation is counted separately. Earlier enterprise sessions may
+need to reconnect even if they previously supplied a valid assertion.
+
+Root frame handlers are joined before subscription cleanup. Audio teardown joins
+its writer, forwarder and control reader. HTTP response bodies and asynchronous
+producers retain work tickets through completion, including event-triggered
+workflow runs and queued audit appends. Cancellation counts, heartbeat
+expiry, readiness removal and replacement boots do not prove completion. The
+client need not consume bytes already sent before the fence.
+
+The new tables are operator-global evidence and remain after target deletion.
+They add no triggers, functions or foreign keys. Migration 0082 is additive:
+old relays ignore the new tables and nullable receipt columns. Desired-state
+and migrated catalogs are compared in the existing PostgreSQL parity test.
+
+### Production activation is not yet available
+
+**This draft does not satisfy BUZZ-512's production-active acceptance.** A trusted
+baseline verifier remains unfinished scope of that same ticket. Production
+builds hard-disable the authority input to completion/readback. Only buzz-db's
+own `cfg(test)` modules can exercise verified-baseline active transitions.
+There is no public arm, external discharge, force-active, reset or clear API.
+Do not set the baseline through operational SQL as a substitute for verification.
+
+A baseline authority must prove the complete serving-route inventory, compatible
+images/capabilities, and absence of every old or dark-mode nonparticipant and
+its work. It must enforce admission and routing restrictions against reentry.
+An evidence-kind string, caller assertion, missing pod or signed inventory
+snapshot alone is insufficient. No such authority is included here.
+
+Before an eventual baseline is armed, all serving routes must be covered.
+After arming, a new process must participate before serving *any* host, including
+free hosts, or durably invalidate the epoch under the scope lock before serving.
+Without writer access it cannot do either. This adds startup/scale-out
+availability cost. Already-participating free sessions preserve existing outage
+behavior; there are no periodic registration leases or automatic fleet drains.
+The first draft's startup fallback is dark-only and cannot establish a baseline.
+
+Baseline invalidation makes otherwise eligible operations pending; lifecycle,
+required-policy or issuer-trust loss still wins as unavailable. Historical
+activation time and append-only per-epoch evidence (including the baseline and
+participating boots) are retained separately from current eligibility. Required policy
+and local floors never clear because a baseline invalidates. A rollback must not
+serve required hosts with pre-511 code. If no compatible rollback exists, stop
+serving those hosts. No rollout or migration execution is authorized by this PR.
+
+A boot may self-retire only after admission irreversibly stops and owned work
+has drained. A hard stop or unresolved work leaves obligations pending. External
+death recovery remains unsupported until a concrete trust source and verifier
+can prove that an incarnation cannot resume; a new pod cannot retire its
+predecessor. Preserve the task database and evidence while investigating.
+
+Required communities admitted under global Shadow use real FI sessions. Signed
+administrative disconnect commands now close matching enforced sessions locally
+and across pods independently of the global rollout mode. Optional shadow
+observations remain in their separate observation registry.

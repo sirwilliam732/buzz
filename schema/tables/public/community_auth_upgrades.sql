@@ -10,5 +10,8 @@ CREATE TABLE community_auth_upgrades (
     expected_issuer TEXT NOT NULL,
     operator_pubkey TEXT NOT NULL,
     policy_generation BIGINT NOT NULL CHECK (policy_generation > 0),
-    accepted_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    accepted_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    activated_at TIMESTAMPTZ,
+    activation_epoch BIGINT,
+    activation_history JSONB NOT NULL DEFAULT '[]'
 );

@@ -565,6 +565,9 @@ mod postgres_tests {
             "operator_listener_pubkeys",
             "operator_listener_outbox",
             "community_auth_upgrades",
+            "community_auth_baseline",
+            "community_auth_boots",
+            "community_auth_obligations",
         ] {
             if normalized[insert_pos..].contains(&format!("'{value}'")) {
                 globals.insert(value.to_owned());
@@ -2891,6 +2894,9 @@ mod postgres_tests {
             "relay_admin_outbox",
             "relay_operator_audit",
             "community_auth_upgrades",
+            "community_auth_baseline",
+            "community_auth_boots",
+            "community_auth_obligations",
             "entity_deletion_approvals",
             "entity_deletion_requests",
             "artifact_heads",

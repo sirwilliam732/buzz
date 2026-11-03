@@ -551,7 +551,6 @@ mod tests {
 
         let manager_clone = manager.clone();
         tokio::spawn(async move { manager_clone.run_cache_invalidation_subscriber().await });
-        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
 
         let channel_id = Uuid::new_v4();
         let pubkey = Keys::generate().public_key().to_bytes().to_vec();
@@ -562,23 +561,34 @@ mod tests {
 
         let ctx = ctx(0xaaaa, "a.example");
 
-        manager
-            .publish_cache_invalidation(&ctx, &sent)
+        for sent in [sent, CacheInvalidation::CommunityAuthPolicy] {
+            // Observe this subscriber's actual receipt. Other live subscribers
+            // cannot make Redis's aggregate subscriber count a readiness proof.
+            let received = tokio::time::timeout(tokio::time::Duration::from_secs(2), async {
+                loop {
+                    manager
+                        .publish_cache_invalidation(&ctx, &sent)
+                        .await
+                        .expect("publish failed");
+                    while let Ok(received) = rx.try_recv() {
+                        if received.community_id == ctx.community() && received.invalidation == sent
+                        {
+                            return received;
+                        }
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
             .await
-            .expect("publish failed");
-
-        let received = tokio::time::timeout(tokio::time::Duration::from_secs(2), rx.recv())
-            .await
-            .expect("timeout")
-            .expect("channel closed");
-
-        assert_eq!(
-            received,
-            ScopedCacheInvalidation {
-                community_id: ctx.community(),
-                invalidation: sent,
-            }
-        );
+            .expect("this subscriber receives the scoped payload");
+            assert_eq!(
+                received,
+                ScopedCacheInvalidation {
+                    community_id: ctx.community(),
+                    invalidation: sent
+                }
+            );
+        }
     }
 
     #[tokio::test]

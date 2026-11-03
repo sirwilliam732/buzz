@@ -2972,7 +2972,7 @@ pub async fn workflow_webhook(
     let db = state.db.clone();
     let def_value = workflow.definition.clone();
     let trigger_ctx_clone = trigger_ctx.clone();
-    tokio::spawn(async move {
+    crate::auth_activation::spawn(async move {
         let def: buzz_workflow::WorkflowDef = match serde_json::from_value(def_value) {
             Ok(d) => d,
             Err(e) => {

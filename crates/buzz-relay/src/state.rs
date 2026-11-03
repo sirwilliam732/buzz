@@ -97,6 +97,8 @@ impl ProvenIdentity {
 /// Per-socket lifecycle controls shared by the registry and the writer.
 #[derive(Clone)]
 pub(crate) struct CommunityConnectionControl {
+    /// Frame handlers are joined before subscription cleanup and deregistration.
+    pub(crate) handler_tasks: tokio_util::task::TaskTracker,
     cancel: CancellationToken,
     reason_tx: watch::Sender<Option<CommunityDisconnectReason>>,
     /// NIP-42-proven pubkey plus the NIP-FI session it was admitted
@@ -126,6 +128,7 @@ impl CommunityConnectionControl {
         Self {
             cancel,
             reason_tx,
+            handler_tasks: tokio_util::task::TaskTracker::new(),
             proven_identity: Arc::new(std::sync::RwLock::new(None)),
             terminal_frame_tx: Arc::new(std::sync::Mutex::new(None)),
             pubkey: Arc::default(),
@@ -1474,7 +1477,7 @@ pub struct AppState {
     pub channel_visibility_cache: Arc<moka::sync::Cache<(CommunityId, Uuid), String>>,
 
     /// Bounded channel for audit logging, absent when audit logging is disabled.
-    pub audit_tx: Option<mpsc::Sender<buzz_audit::NewAuditEntry>>,
+    pub audit_tx: Option<TrackedAuditSender>,
     /// Media storage client (S3/MinIO).
     pub media_storage: Arc<MediaStorage>,
     /// Cached worker snapshot and storage metric emission bookkeeping. See
@@ -1617,6 +1620,8 @@ pub struct AppState {
 
     /// Primary-database policy lookup; tests can substitute the same source seam.
     pub(crate) nip_fi_policy: Arc<dyn crate::nip_fi_policy::PolicySource>,
+    pub(crate) auth_activation: Arc<crate::auth_activation::WorkTracker>,
+    pub(crate) auth_activation_boot: std::sync::OnceLock<Uuid>,
 
     /// The shared JWKS source backing `nip_fi_verifier`, exposed so `main.rs`
     /// can warm it at startup and drive the background refresh loop.
@@ -1695,7 +1700,7 @@ impl AppState {
         let search_arc = Arc::new(search);
 
         let audit_arc = audit.into().map(Arc::new);
-        let (audit_tx, mut audit_rx) = mpsc::channel::<buzz_audit::NewAuditEntry>(1000);
+        let (audit_tx, mut audit_rx) = mpsc::channel::<TrackedAuditEntry>(1000);
         let audit_for_worker = audit_arc.clone();
         let audit_cancel = CancellationToken::new();
         let audit_cancel_worker = audit_cancel.clone();
@@ -1709,7 +1714,7 @@ impl AppState {
                 tokio::select! {
                     entry = audit_rx.recv() => {
                         match entry {
-                            Some(entry) => log_audit_entry(&audit_for_worker, entry).await,
+                            Some((entry, work)) => { log_audit_entry(&audit_for_worker, entry).await; drop(work); },
                             None => break, // channel closed
                         }
                     }
@@ -1723,8 +1728,9 @@ impl AppState {
             }
             // Drain: recv() returns buffered entries, then None once empty.
             let mut drained = 0u32;
-            while let Some(entry) = audit_rx.recv().await {
+            while let Some((entry, work)) = audit_rx.recv().await {
                 log_audit_entry(&audit_for_worker, entry).await;
+                drop(work);
                 drained += 1;
             }
             if drained > 0 {
@@ -1827,7 +1833,7 @@ impl AppState {
                     .support_invalidation_closures()
                     .build(),
             ),
-            audit_tx: audit_enabled.then_some(audit_tx),
+            audit_tx: audit_enabled.then_some(TrackedAuditSender(audit_tx)),
             media_storage: Arc::new(media_storage),
             storage_sweep: Arc::new(tokio::sync::Mutex::new(
                 crate::storage_sweep::StorageSweepState::default(),
@@ -1907,6 +1913,8 @@ impl AppState {
             mesh: Arc::new(std::sync::OnceLock::new()),
             nip_fi_verifier,
             nip_fi_policy,
+            auth_activation: Arc::default(),
+            auth_activation_boot: std::sync::OnceLock::new(),
             nip_fi_jwks_source,
             // NIP-FI deny map and command verifier are initialized lazily by
             // `build_nip_fi_command_components` in `api::nip_fi`, called from
@@ -2092,6 +2100,13 @@ impl AppState {
         );
     }
 
+    /// Invalidate the activation policy snapshot locally and on the existing
+    /// cluster hint bus. Durable reconciliation is the delivery-failure backstop.
+    pub fn invalidate_community_auth_policy(&self, tenant: &TenantContext) {
+        self.auth_activation.wake_policy();
+        self.spawn_cache_invalidation(tenant, CacheInvalidation::CommunityAuthPolicy);
+    }
+
     /// Local-only membership drop. The cross-pod consumer calls this directly so
     /// applying a received drop never re-publishes it.
     pub(crate) fn invalidate_membership_local(
@@ -2209,6 +2224,7 @@ impl AppState {
         invalidation: CacheInvalidation,
     ) {
         match invalidation {
+            CacheInvalidation::CommunityAuthPolicy => self.auth_activation.wake_policy(),
             CacheInvalidation::Membership { channel_id, pubkey } => {
                 self.invalidate_membership_local(community_id, channel_id, &pubkey);
             }
@@ -2822,6 +2838,27 @@ fn build_nip_fi_components(config: &crate::config::Config) -> NipFiComponents {
 
 /// Log a single audit entry with metrics. Extracted so the normal loop
 /// and the post-cancel drain share the same logic.
+type TrackedAuditEntry = (
+    buzz_audit::NewAuditEntry,
+    Option<crate::auth_activation::WorkTicket>,
+);
+
+/// Bounded audit queue retaining request ownership through the durable append.
+#[derive(Clone)]
+pub struct TrackedAuditSender(mpsc::Sender<TrackedAuditEntry>);
+impl TrackedAuditSender {
+    /// Enqueue an audit effect and retain its originating generation until append.
+    pub async fn send(
+        &self,
+        entry: buzz_audit::NewAuditEntry,
+    ) -> Result<(), mpsc::error::SendError<buzz_audit::NewAuditEntry>> {
+        self.0
+            .send((entry, crate::auth_activation::current_ticket()))
+            .await
+            .map_err(|error| mpsc::error::SendError(error.0 .0))
+    }
+}
+
 async fn log_audit_entry(audit: &buzz_audit::AuditService, entry: buzz_audit::NewAuditEntry) {
     let t = std::time::Instant::now();
     let mut retry_delay_ms = 50u64;

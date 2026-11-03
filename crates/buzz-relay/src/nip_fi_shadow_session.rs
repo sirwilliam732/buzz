@@ -607,7 +607,7 @@ pub(crate) mod tests {
     // ownerless session of the agent key take no end. Mutation: dropping the
     // owner arm of `would_close` loses every `end/revoked`.
     #[test]
-    fn owner_disconnect_ends_owned_agent_sessions_and_closes_nothing() {
+    fn owner_disconnect_preserves_optional_shadow_and_closes_enforced_sessions() {
         let records = shadow_records_by_route(async {
             let state = pod(8).await;
             let (agent, owner) = (Keys::generate().public_key(), Keys::generate().public_key());
@@ -625,7 +625,12 @@ pub(crate) mod tests {
             let control = crate::state::CommunityConnectionControl::new(cancel.clone());
             let (terminal_tx, mut terminal_rx) = tokio::sync::mpsc::channel(1);
             control.set_terminal_frame_sender(terminal_tx);
-            control.set_proven_identity(
+            // Optional Shadow sockets never register enforced FI provenance.
+            control.set_proven_identity(agent.to_bytes().to_vec(), None);
+            let required_cancel = CancellationToken::new();
+            let required_control =
+                crate::state::CommunityConnectionControl::new(required_cancel.clone());
+            required_control.set_proven_identity(
                 agent.to_bytes().to_vec(),
                 Some(NipFiSession::from_assertion(&owned_assertion(agent, owner))),
             );
@@ -635,6 +640,11 @@ pub(crate) mod tests {
                     .community_connections
                     .register(uuid::Uuid::new_v4(), community, control);
 
+            let _required_guard = state.community_connections.register(
+                uuid::Uuid::new_v4(),
+                community,
+                required_control,
+            );
             let admitted = [owned("ws"), owned("audio")];
             let pending = [owned("ws"), owned("audio")];
             let ownerless = session(&state, Some(agent), Duration::hours(1));
@@ -660,7 +670,14 @@ pub(crate) mod tests {
             for s in &pending {
                 s.admit();
             }
-            assert!(!cancel.is_cancelled(), "shadow never cancels a socket");
+            assert!(
+                !cancel.is_cancelled(),
+                "optional shadow socket remains open"
+            );
+            assert!(
+                required_cancel.is_cancelled(),
+                "enforced session closes even in global Shadow"
+            );
             assert!(terminal_rx.try_recv().is_err(), "shadow sends no frame");
         });
         let expected = [

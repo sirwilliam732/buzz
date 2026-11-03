@@ -43,8 +43,9 @@ pub fn conn_control_channel(ctx: &TenantContext) -> String {
 /// connected to at that moment is irrelevant.
 pub const NIP_FI_DISCONNECT_CHANNEL: &str = "buzz:nip-fi:disconnect";
 
-/// Channel for disconnects accepted in shadow mode.  Only shadow pods
-/// subscribe, so a shadow command never reaches an enforce pod.
+/// Legacy shadow-only topic, retained for rolling-upgrade subscribers.
+/// New signed commands use the real topic to reach enforced FI sessions even
+/// when the sending pod's global rollout mode is Shadow.
 pub const NIP_FI_SHADOW_DISCONNECT_CHANNEL: &str = "buzz:nip-fi:shadow-disconnect";
 
 /// A NIP-FI admin-disconnect command broadcast cross-pod after the local deny

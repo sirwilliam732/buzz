@@ -13,7 +13,11 @@ use tracing_subscriber::{layer::Context, prelude::*, registry::LookupSpan, Layer
 // With a proxy, the first page's span close also pauses it. That runs inside
 // the request's poll, before the second page's query is written, so the second
 // page stays pending however fast the database answers.
-struct AuxPages(Arc<AtomicUsize>, Option<Arc<PausingProxy>>);
+struct AuxPages(
+    Arc<AtomicUsize>,
+    Option<Arc<PausingProxy>>,
+    Arc<futures_util::task::AtomicWaker>,
+);
 impl<S> Layer<S> for AuxPages
 where
     S: tracing::Subscriber + for<'a> LookupSpan<'a>,
@@ -25,6 +29,7 @@ where
             if let Some(proxy) = &self.1 {
                 proxy.set_paused(true);
             }
+            self.2.wake();
         }
     }
 }
@@ -34,11 +39,16 @@ async fn pause_after_aux_page<F: Future>(
     proxy: Option<Arc<PausingProxy>>,
 ) -> std::pin::Pin<Box<impl Future<Output = F::Output>>> {
     let pages = Arc::new(AtomicUsize::new(0));
-    let subscriber = tracing_subscriber::registry().with(AuxPages(pages.clone(), proxy));
+    let wake = Arc::new(futures_util::task::AtomicWaker::new());
+    let subscriber =
+        tracing_subscriber::registry().with(AuxPages(pages.clone(), proxy, wake.clone()));
     let mut request = Box::pin(request.with_subscriber(subscriber));
     tokio::time::timeout(
         Duration::from_secs(5),
         std::future::poll_fn(|cx| {
+            // The HTTP handler owns a task independently of its client future.
+            // Wake this observer when the producer reaches the real span seam.
+            wake.register(cx.waker());
             assert!(
                 request.as_mut().poll(cx).is_pending(),
                 "must pause inside closure"
@@ -58,6 +68,22 @@ async fn pause_after_aux_page<F: Future>(
         "barrier must precede closure completion"
     );
     request
+}
+
+// Detached request ownership makes a poll boundary alone insufficient to pause
+// the handler. Hold its next real database exchange at the same observed span.
+async fn proxy_request_pool(f: &mut Fixture) -> Arc<PausingProxy> {
+    let options: sqlx::postgres::PgConnectOptions =
+        crate::test_support::database_url().parse().unwrap();
+    let proxy =
+        Arc::new(PausingProxy::spawn(options.get_host().to_owned(), options.get_port()).await);
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .connect_with(options.host("127.0.0.1").port(proxy.port))
+        .await
+        .unwrap();
+    Arc::make_mut(&mut f.state).db = buzz_db::Db::from_pool(pool);
+    proxy
 }
 
 #[tokio::test]
@@ -194,7 +220,7 @@ async fn thread_window_retries_aux_access_revocation_during_closure() {
 }
 
 async fn assert_aux_access_change(grant: bool) {
-    let f = Fixture::new().await;
+    let mut f = Fixture::new().await;
     let reply = f.reply(0).await;
     // A visible first-hop event ensures the closure has a second hop where
     // polling can pause, even when the cross-channel edit is initially hidden.
@@ -218,8 +244,14 @@ async fn assert_aux_access_change(grant: bool) {
         "pre-transition visibility control"
     );
 
-    let request = pause_after_aux_page(f.post(&f.keys, "/query", json!([filter])), None).await;
+    let proxy = proxy_request_pool(&mut f).await;
+    let request = pause_after_aux_page(
+        f.post(&f.keys, "/query", json!([filter])),
+        Some(proxy.clone()),
+    )
+    .await;
     set_access(&f, aux_channel, grant).await;
+    proxy.set_paused(false);
     let current = f
         .state
         .db
@@ -324,7 +356,7 @@ async fn thread_window_batch_discards_earlier_windows_after_revocation() {
     // Cover both repeated-root batches and revoking an earlier window's channel
     // while the later window remains authorized. All output must fail closed.
     for same_channel in [true, false] {
-        let f = Fixture::new().await;
+        let mut f = Fixture::new().await;
         f.reply(0).await;
         let mut first = f.filter();
         first["include_aux"] = json!(false);
@@ -355,8 +387,14 @@ async fn thread_window_batch_discards_earlier_windows_after_revocation() {
         let (status, before) = f.post(&f.keys, "/query", batch.clone()).await;
         assert_eq!(status, StatusCode::OK, "{before}");
         assert_eq!(ids(&before, Some(39007)).len(), 2);
-        let request = pause_after_aux_page(f.post(&f.keys, "/query", batch.clone()), None).await;
+        let proxy = proxy_request_pool(&mut f).await;
+        let request = pause_after_aux_page(
+            f.post(&f.keys, "/query", batch.clone()),
+            Some(proxy.clone()),
+        )
+        .await;
         set_access(&f, f.channel, false).await;
+        proxy.set_paused(false);
         let (status, body) = request.await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
         assert_eq!(
