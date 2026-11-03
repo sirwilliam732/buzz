@@ -146,6 +146,7 @@ async fn failed_preconditions_leave_free_policy_and_no_receipt() {
     assert_eq!(
         policy(&db, &request).await,
         CommunityAuthPolicy {
+            community_id: request.community_id,
             requires_nip_fi: false,
             policy_generation: 0
         }
@@ -392,6 +393,7 @@ async fn migration_schema_expansion_preserves_existing_optional_rows_with_and_wi
         assert_eq!(
             db.community_auth_policy(community).await.unwrap(),
             Some(CommunityAuthPolicy {
+                community_id: *community.as_uuid(),
                 requires_nip_fi: false,
                 policy_generation: 0,
             })
@@ -462,6 +464,7 @@ async fn host_policy_tracks_primary_requirement_and_serving_lifecycle() {
     assert_eq!(
         db.community_auth_policy_for_host(host).await.unwrap(),
         Some(CommunityAuthPolicy {
+            community_id: request.community_id,
             requires_nip_fi: false,
             policy_generation: 0
         })
@@ -470,6 +473,7 @@ async fn host_policy_tracks_primary_requirement_and_serving_lifecycle() {
     assert_eq!(
         db.community_auth_policy_for_host(host).await.unwrap(),
         Some(CommunityAuthPolicy {
+            community_id: request.community_id,
             requires_nip_fi: true,
             policy_generation: upgraded.policy_generation
         })
