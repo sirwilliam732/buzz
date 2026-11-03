@@ -53,11 +53,17 @@ pub(crate) enum CommunityDisconnectReason {
     /// Root-socket ban or roster removal. Its `OK false` frame carries the
     /// reason, so the close stays bare.
     Removed,
+    /// The community now requires a newer enforced admission.
+    AuthPolicyUpgraded,
 }
 
 impl CommunityDisconnectReason {
     pub(crate) fn close_message(self) -> WsMessage {
         match self {
+            Self::AuthPolicyUpgraded => WsMessage::Close(Some(axum::extract::ws::CloseFrame {
+                code: axum::extract::ws::close_code::POLICY,
+                reason: WsUtf8Bytes::from_static("community authentication upgraded"),
+            })),
             Self::CommunityArchived => WsMessage::Close(Some(axum::extract::ws::CloseFrame {
                 code: axum::extract::ws::close_code::POLICY,
                 reason: WsUtf8Bytes::from_static("community archived"),
@@ -374,6 +380,17 @@ impl CommunityConnectionControl {
                 true
             }
         });
+    }
+
+    pub(crate) fn disconnect_auth_policy(&self) {
+        self.reason_tx.send_if_modified(|reason| {
+            if reason.is_some() {
+                return false;
+            }
+            *reason = Some(CommunityDisconnectReason::AuthPolicyUpgraded);
+            true
+        });
+        self.cancel.cancel();
     }
 
     fn disconnect_community(&self, reason: CommunityDisconnectReason) {

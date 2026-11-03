@@ -1089,10 +1089,12 @@ async fn nip11_or_ws_handler(
                         &tenant.community().as_uuid().to_string(),
                         admitted_generation,
                     ) else {
+                        crate::auth_activation::deny_upgraded_socket(socket).await;
                         return;
                     };
                     if let Some(assertion) = &nip_fi_assertion {
                         if !ticket.enforce_issuer(assertion.identity().issuer()) {
+                            crate::auth_activation::deny_upgraded_socket(socket).await;
                             return;
                         }
                     }

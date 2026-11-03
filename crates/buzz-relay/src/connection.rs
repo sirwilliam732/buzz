@@ -397,7 +397,6 @@ pub(crate) async fn handle_connection(
     let cancel = CancellationToken::new();
     let close_for_run = Arc::clone(&close);
     let close_for_drain = Arc::clone(&close);
-    let _activation_cancel = crate::auth_activation::link_cancel(cancel.clone());
 
     // Fix 3: Arm the NIP-FI gate and expiry task BEFORE the `is_community_active`
     // bootstrap await so the session deadline is enforced even when the DB check
@@ -425,6 +424,7 @@ pub(crate) async fn handle_connection(
             assertion.asserted_key(),
         ));
     }
+    let _activation_cancel = crate::auth_activation::link_cancel(control.clone());
     control.attach_nip_fi_shadow(nip_fi_shadow);
     // Its first verified AUTH writes it; else the read loop's end does.
     let shadow_line = shadow_line.map(Arc::new);

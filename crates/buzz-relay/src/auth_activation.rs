@@ -273,14 +273,25 @@ where
 }
 /// Forward cancellation without giving a detached watcher ownership of work.
 pub(crate) fn link_cancel(
-    cancel: CancellationToken,
+    control: crate::state::CommunityConnectionControl,
 ) -> Option<tokio_util::task::AbortOnDropHandle<()>> {
     let source = WORK.try_with(WorkTicket::cancellation).ok()?;
+    let cancel = control.cancellation_token();
     Some(tokio_util::task::AbortOnDropHandle::new(tokio::spawn(
         async move {
-            tokio::select! { _ = source.cancelled() => cancel.cancel(), _ = cancel.cancelled() => {} }
+            tokio::select! { _ = source.cancelled() => control.disconnect_auth_policy(), _ = cancel.cancelled() => {} }
         },
     )))
+}
+
+/// Post-upgrade policy races use a bounded, explicit 1008 close on both routes.
+/// Handshake-time policy failures retain their normal HTTP denial response.
+pub(crate) async fn deny_upgraded_socket(mut socket: axum::extract::ws::WebSocket) {
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        socket.send(crate::state::CommunityDisconnectReason::AuthPolicyUpgraded.close_message()),
+    )
+    .await;
 }
 
 pub(crate) fn spawn_on<F>(
