@@ -618,6 +618,13 @@ mod postgres_tests {
         let metrics = reserve_closed_port().to_string();
         let bind = format!("127.0.0.1:{}", reserve_closed_port());
         let image = format!("shutdown-fixture-{}", uuid::Uuid::new_v4());
+        // Force health readiness to precede activation registration, as it can
+        // in CI. Private readiness is not proof the public listener is bound.
+        let mut startup_hold = pool.begin().await.unwrap();
+        sqlx::query("SELECT pg_advisory_xact_lock(1112883541,0)")
+            .execute(&mut *startup_hold)
+            .await
+            .unwrap();
         let mut process = RelayProcess::spawn(&[
             ("BUZZ_RELAY_PRIVATE_KEY", VALID_RELAY_PRIVATE_KEY),
             ("DATABASE_URL", &database_url),
@@ -633,6 +640,31 @@ mod postgres_tests {
             ("BUZZ_RELAY_IMAGE_DIGEST", &image),
         ]);
         assert!(wait_for_readiness(&mut process, health).starts_with("HTTP/1.1 200"));
+        let registered: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM community_auth_boots WHERE image=$1")
+                .bind(&image)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            registered, 0,
+            "registration is deliberately held after readiness"
+        );
+        startup_hold.commit().await.unwrap();
+        tokio::time::timeout(CHILD_TIMEOUT, async {
+            loop {
+                assert!(
+                    process.try_wait().is_none(),
+                    "relay exited before public bind"
+                );
+                if tokio::net::TcpStream::connect(&bind).await.is_ok() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("public listener must bind after registration");
         let boot: uuid::Uuid =
             sqlx::query_scalar("SELECT boot_id FROM community_auth_boots WHERE image=$1")
                 .bind(&image)
