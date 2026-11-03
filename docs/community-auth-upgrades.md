@@ -370,7 +370,10 @@ falls back to unregistered public serving. Registered boots keep reconciling and
 draining even if operators later disable acceptance or change deployment settings.
 A replacement boot installs all durable requirements before listening. The
 reconciler only ACKs its own unsatisfied obligations; already satisfied operations
-cause no repeated ACK transaction while production completion is disabled.
+cause no repeated ACK transaction while production completion is disabled. When the
+future trusted authority verifies an epoch, it must recompute completion from
+persisted exact ACKs under the scope lock; already satisfied boots must not need
+perpetual ACK writes to trigger that transition.
 
 A **dark bypass boot is not a verified participant**. There is no production
 arming endpoint in this draft. A future trusted arming authority must establish
@@ -416,7 +419,10 @@ pending age, scope-lock timeout logs, DB pool wait, request latency, CPU and
 memory against the same workload on bypass boots. Retirement success is meaningful
 only for observed graceful exits; OOM/SIGKILL and drain-timeout boots intentionally
 remain pending. Both TCP and UDS must stop accepting and join, followed by all
-socket/handler/body/audit tickets, before a boot persists retirement. The existing
+socket/handler/body/audit tickets, before a boot persists retirement. SIGTERM
+signals a sticky audio-only Close 1012 drain in the same process; audio upgrades
+racing shutdown also self-cancel, while root sockets retain their existing jitter
+policy. This does not drain other boots or expire unrelated sessions. The existing
 hard-exit backstop remains armed throughout; it never converts an unknown drain
 to retirement.
 

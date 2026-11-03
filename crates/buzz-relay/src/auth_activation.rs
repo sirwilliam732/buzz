@@ -525,6 +525,32 @@ mod postgres_tests;
 
 #[cfg(test)]
 mod ownership_tests {
+    #[test]
+    fn process_audio_drain_is_sticky_without_cancelling_root_jitter() {
+        let registry = crate::state::CommunityConnectionRegistry::new();
+        let community = buzz_core::CommunityId::from_uuid(uuid::Uuid::new_v4());
+        let root = crate::state::CommunityConnectionControl::new(
+            tokio_util::sync::CancellationToken::new(),
+        );
+        let audio = crate::state::CommunityConnectionControl::new_audio(
+            tokio_util::sync::CancellationToken::new(),
+        );
+        let _root = registry.register(uuid::Uuid::new_v4(), community, root.clone());
+        let _audio = registry.register(uuid::Uuid::new_v4(), community, audio.clone());
+        assert_eq!(registry.drain_audio(), 1);
+        assert!(audio.cancellation_token().is_cancelled());
+        assert_eq!(
+            *audio.disconnect_reason().borrow(),
+            Some(crate::state::CommunityDisconnectReason::RelayRestart)
+        );
+        assert!(!root.cancellation_token().is_cancelled());
+        let late = crate::state::CommunityConnectionControl::new_audio(
+            tokio_util::sync::CancellationToken::new(),
+        );
+        let _late = registry.register(uuid::Uuid::new_v4(), community, late.clone());
+        assert!(late.cancellation_token().is_cancelled());
+    }
+
     use super::*;
     use http_body_util::BodyExt;
 

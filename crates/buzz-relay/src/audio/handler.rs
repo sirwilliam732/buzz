@@ -338,7 +338,7 @@ pub(crate) async fn handle_audio_connection(
     // the inner handler drains it via ws_send.
     let (pre_terminal_ctrl_tx, pre_terminal_ctrl_rx) =
         tokio::sync::mpsc::channel::<axum::extract::ws::Message>(1);
-    let control = CommunityConnectionControl::new(cancel).with_client_ip(client_ip);
+    let control = CommunityConnectionControl::new_audio(cancel).with_client_ip(client_ip);
     if let Some(assertion) = &nip_fi_assertion {
         control.attach_nip_fi_enforce(crate::nip_fi_shadow::EnforceSession::new(
             "audio",

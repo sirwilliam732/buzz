@@ -55,11 +55,17 @@ pub(crate) enum CommunityDisconnectReason {
     Removed,
     /// The community now requires a newer enforced admission.
     AuthPolicyUpgraded,
+    /// This process is shutting down; reconnect to another serving boot.
+    RelayRestart,
 }
 
 impl CommunityDisconnectReason {
     pub(crate) fn close_message(self) -> WsMessage {
         match self {
+            Self::RelayRestart => WsMessage::Close(Some(axum::extract::ws::CloseFrame {
+                code: axum::extract::ws::close_code::RESTART,
+                reason: WsUtf8Bytes::from_static("relay restarting"),
+            })),
             Self::AuthPolicyUpgraded => WsMessage::Close(Some(axum::extract::ws::CloseFrame {
                 code: axum::extract::ws::close_code::POLICY,
                 reason: WsUtf8Bytes::from_static("community authentication upgraded"),
@@ -106,6 +112,7 @@ pub(crate) struct CommunityConnectionControl {
     /// Frame handlers are joined before subscription cleanup and deregistration.
     pub(crate) handler_tasks: tokio_util::task::TaskTracker,
     cancel: CancellationToken,
+    audio: bool,
     reason_tx: watch::Sender<Option<CommunityDisconnectReason>>,
     /// NIP-42-proven pubkey plus the NIP-FI session it was admitted
     /// under; matched by the registry's `disconnect_nip_fi` scan.  [FI-TRACE-DENY-SET]
@@ -133,6 +140,7 @@ impl CommunityConnectionControl {
         let (reason_tx, _reason_rx) = watch::channel(None);
         Self {
             cancel,
+            audio: false,
             reason_tx,
             handler_tasks: tokio_util::task::TaskTracker::new(),
             proven_identity: Arc::new(std::sync::RwLock::new(None)),
@@ -153,6 +161,24 @@ impl CommunityConnectionControl {
 
     pub(crate) fn client_ip(&self) -> Option<std::net::IpAddr> {
         self.client_ip
+    }
+
+    pub(crate) fn new_audio(cancel: CancellationToken) -> Self {
+        Self {
+            audio: true,
+            ..Self::new(cancel)
+        }
+    }
+
+    fn disconnect_restart(&self) {
+        self.reason_tx.send_if_modified(|reason| {
+            if reason.is_some() {
+                return false;
+            }
+            *reason = Some(CommunityDisconnectReason::RelayRestart);
+            true
+        });
+        self.cancel.cancel();
     }
 
     /// Carries the socket's shadow session to its AUTH handler, fenced by
@@ -471,6 +497,7 @@ struct ConnEntry {
 /// registration cancels the token; archival before registration is observed by
 /// the revalidation. The returned guard removes the entry on every exit path.
 pub struct CommunityConnectionRegistry {
+    draining_audio: AtomicBool,
     connections: Arc<DashMap<Uuid, (CommunityId, CommunityConnectionControl)>>,
 }
 
@@ -484,6 +511,7 @@ impl CommunityConnectionRegistry {
     /// Creates an empty lifecycle registry.
     pub fn new() -> Self {
         Self {
+            draining_audio: AtomicBool::new(false),
             connections: Arc::new(DashMap::new()),
         }
     }
@@ -496,11 +524,31 @@ impl CommunityConnectionRegistry {
         control: CommunityConnectionControl,
     ) -> CommunityConnectionGuard {
         self.connections
-            .insert(connection_id, (community_id, control));
+            .insert(connection_id, (community_id, control.clone()));
+        // Insert-then-check pairs with drain's store-then-iterate. Root sockets
+        // retain ConnectionManager's separate jittered restart-close protocol.
+        if control.audio && self.draining_audio.load(Ordering::SeqCst) {
+            control.disconnect_restart();
+        }
         CommunityConnectionGuard {
             connection_id,
             connections: Arc::clone(&self.connections),
         }
+    }
+
+    /// Stop this process's audio sockets, including upgrades racing shutdown.
+    /// This signals cleanup only; the boot's work tracker proves their drain.
+    pub fn drain_audio(&self) -> usize {
+        self.draining_audio.store(true, Ordering::SeqCst);
+        let mut signalled = 0;
+        for entry in self.connections.iter() {
+            let control = &entry.value().1;
+            if control.audio {
+                control.disconnect_restart();
+                signalled += 1;
+            }
+        }
+        signalled
     }
 
     /// Disconnects every socket type currently bound to an archived community.
@@ -2936,6 +2984,7 @@ impl std::fmt::Debug for AppState {
 
 #[cfg(test)]
 pub(crate) mod tests {
+
     use super::*;
     use crate::connection::{AuthState, ConnectionState};
     use std::collections::HashMap;

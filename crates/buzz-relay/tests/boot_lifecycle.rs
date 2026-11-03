@@ -573,13 +573,11 @@ fn successful_main_emits_complete_lifecycle_and_reports_current_startup_step() {
 mod postgres_tests {
     use super::*;
 
-    /// Boots the real default TCP-only binary, holds an admitted EVENT at a
-    /// writer lock, and sends real SIGTERM. A restart Close cannot retire its
-    /// incarnation while that handler/effect is still outstanding.
+    /// Boots the real TCP-only binary and holds either an admitted EVENT or
+    /// audio teardown at a writer lock across SIGTERM. A restart Close cannot
+    /// retire the incarnation while that handler/effect is still outstanding.
     #[cfg(unix)]
-    #[tokio::test]
-    #[ignore = "requires PostgreSQL"]
-    async fn tcp_only_sigterm_retires_only_after_real_held_work_drains() {
+    async fn sigterm_retires_after_held_work(audio: bool) {
         use futures_util::{SinkExt, StreamExt};
         use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
         let database_url = std::env::var("DATABASE_URL").unwrap();
@@ -588,10 +586,33 @@ mod postgres_tests {
         let db = buzz_db::Db::from_pool(pool.clone());
         let key = nostr::Keys::generate();
         let host = format!("shutdown-{}.example", uuid::Uuid::new_v4());
-        let _ = db
+        let created = db
             .create_community_with_owner(&host, &key.public_key().to_hex(), &key)
             .await
             .unwrap();
+        let buzz_db::CreateCommunityWithOwnerResult::Created(row) = created.outcome else {
+            panic!("create")
+        };
+        let channel = uuid::Uuid::new_v4();
+        if audio {
+            db.ensure_user(row.id, &key.public_key().to_bytes())
+                .await
+                .unwrap();
+            db.create_channel_with_id(
+                row.id,
+                channel,
+                "shutdown-audio",
+                buzz_db::channel::ChannelType::Stream,
+                buzz_db::channel::ChannelVisibility::Open,
+                None,
+                &key.public_key().to_bytes(),
+                None,
+            )
+            .await
+            .unwrap();
+            sqlx::query("INSERT INTO channel_members(community_id,channel_id,pubkey,role) VALUES($1,$2,$3,'member') ON CONFLICT DO NOTHING")
+                .bind(row.id.as_uuid()).bind(channel).bind(key.public_key().to_bytes().to_vec()).execute(&pool).await.unwrap();
+        }
         let health = reserve_closed_port();
         let health_value = health.to_string();
         let metrics = reserve_closed_port().to_string();
@@ -618,7 +639,12 @@ mod postgres_tests {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        let mut request = format!("ws://{bind}/").into_client_request().unwrap();
+        let path = if audio {
+            format!("/huddle/{channel}/audio")
+        } else {
+            "/".into()
+        };
+        let mut request = format!("ws://{bind}{path}").into_client_request().unwrap();
         request.headers_mut().insert("host", host.parse().unwrap());
         let (mut client, _) = tokio_tungstenite::connect_async(request).await.unwrap();
         let Message::Text(challenge) = client.next().await.unwrap().unwrap() else {
@@ -627,12 +653,23 @@ mod postgres_tests {
         let challenge: serde_json::Value = serde_json::from_str(&challenge).unwrap();
         let auth = nostr::EventBuilder::new(nostr::Kind::Authentication, "")
             .tag(nostr::Tag::parse(["relay", &format!("ws://{host}")]).unwrap())
-            .tag(nostr::Tag::parse(["challenge", challenge[1].as_str().unwrap()]).unwrap())
+            .tag(
+                nostr::Tag::parse([
+                    "challenge",
+                    if audio {
+                        challenge["challenge"].as_str().unwrap()
+                    } else {
+                        challenge[1].as_str().unwrap()
+                    },
+                ])
+                .unwrap(),
+            )
             .sign_with_keys(&key)
             .unwrap();
         client
             .send(Message::Text(
-                serde_json::json!(["AUTH", auth]).to_string().into(),
+                (if audio {serde_json::json!({"type":"auth","event":auth,"parent_channel_id":null,"protocol_version":1})}
+                    else {serde_json::json!(["AUTH",auth])}).to_string().into(),
             ))
             .await
             .unwrap();
@@ -643,7 +680,10 @@ mod postgres_tests {
                     .unwrap()
             {
                 let value: serde_json::Value = serde_json::from_str(&t).unwrap();
-                if value[0] == "OK" {
+                if audio && value["type"] == "joined" {
+                    break;
+                }
+                if !audio && value[0] == "OK" {
                     assert_eq!(value[2], true, "{value}");
                     break;
                 }
@@ -662,13 +702,14 @@ mod postgres_tests {
             .sign_with_keys(&key)
             .unwrap();
         let event_id = event.id.to_bytes().to_vec();
-        client
-            .send(Message::Text(
-                serde_json::json!(["EVENT", event]).to_string().into(),
-            ))
-            .await
-            .unwrap();
-        tokio::time::timeout(Duration::from_secs(10), async {
+        if !audio {
+            client
+                .send(Message::Text(
+                    serde_json::json!(["EVENT", event]).to_string().into(),
+                ))
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 let waiting: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND $1=ANY(pg_blocking_pids(pid)))")
                     .bind(lock_pid).fetch_one(&pool).await.unwrap();
@@ -676,6 +717,7 @@ mod postgres_tests {
                 tokio::task::yield_now().await;
             }
         }).await.unwrap();
+        }
         let pid = process.child.as_ref().unwrap().id().to_string();
         assert!(Command::new("/bin/kill")
             .args(["-TERM", &pid])
@@ -693,6 +735,16 @@ mod postgres_tests {
         })
         .await
         .unwrap();
+        if audio {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let waiting: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND $1=ANY(pg_blocking_pids(pid)))")
+                        .bind(lock_pid).fetch_one(&pool).await.unwrap();
+                    if waiting {break;}
+                    tokio::task::yield_now().await;
+                }
+            }).await.unwrap();
+        }
         let retired: bool = sqlx::query_scalar(
             "SELECT retired_at IS NOT NULL FROM community_auth_boots WHERE boot_id=$1",
         )
@@ -719,16 +771,38 @@ mod postgres_tests {
         .fetch_one(&pool)
         .await
         .unwrap();
-        let persisted: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM events WHERE id=$1)")
-            .bind(event_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert!(persisted, "held EVENT must finish before the process exits");
+        let persisted: bool = if audio {
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM events WHERE community_id=$1 AND channel_id=$2 AND kind=48102)")
+                .bind(row.id.as_uuid()).bind(channel).fetch_one(&pool).await.unwrap()
+        } else {
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM events WHERE id=$1)")
+                .bind(event_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        };
+        assert!(
+            persisted,
+            "held effect or audio teardown must finish before the process exits"
+        );
         assert!(
             retired,
             "TCP-only graceful completion must persist retirement"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL"]
+    async fn tcp_only_sigterm_retires_only_after_real_held_work_drains() {
+        sigterm_retires_after_held_work(false).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL"]
+    async fn audio_sigterm_retires_only_after_real_held_teardown_drains() {
+        sigterm_retires_after_held_work(true).await;
     }
 
     #[test]

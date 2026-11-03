@@ -2280,6 +2280,7 @@ async fn serve(
     let (shutdown_tx, _) = tokio::sync::watch::channel(false);
     let shutdown_state = Arc::clone(&state);
     let drain_conn_manager = Arc::clone(&state.conn_manager);
+    let drain_audio_registry = Arc::clone(&state.community_connections);
     let drain_jitter_ms = state.config.drain_jitter_ms;
     let tx = shutdown_tx.clone();
     // The real TCP-only SIGTERM witness holds a writer operation across the
@@ -2302,6 +2303,7 @@ async fn serve(
             std::process::exit(1);
         });
         let hard_shutdown_abort = hard_shutdown.abort_handle();
+        let audio_closed = drain_audio_registry.drain_audio();
         // Stop accepting first, then close every live socket. Jitter off (the
         // default) uses the original synchronous all-at-once drain; jitter on
         // retains ownership of every delayed close until its 1012 frame has
@@ -2313,6 +2315,7 @@ async fn serve(
         };
         info!(
             connections = closed,
+            audio_connections = audio_closed,
             jitter_ms = drain_jitter_ms,
             max_jitter_ms = MAX_DRAIN_JITTER_MS,
             "Signalled restart close to all live WebSocket connections"
