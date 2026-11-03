@@ -266,6 +266,135 @@ mod postgres_tests {
     async fn audio_policy_close_waits_for_peer_cleanup_and_exact_ack() {
         journey(true).await;
     }
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "requires Postgres"]
+    async fn activation_callback_refusals_and_success_each_write_one_root_close_line() {
+        use crate::nip_fi_core::test_support::{
+            assertion_verifier, sign_assertion, TEST_COMMUNITY_URI, TEST_ISSUER,
+        };
+        let (_capture, output) = crate::access::tests::capture_scoped();
+        for refusal in [Some("generation"), Some("issuer"), None] {
+            let base = real_db_state().await.unwrap();
+            let mut configured = (*base).clone();
+            let config = Arc::make_mut(&mut configured.config);
+            config.nip_fi_activation_tracking_enabled = true;
+            config.nip_fi.max_connection_lifetime_secs = 3600;
+            config.nip_fi.mode = if refusal == Some("issuer") {
+                buzz_auth::NipFiMode::Enforce
+            } else {
+                buzz_auth::NipFiMode::Off
+            };
+            config.nip_fi.communities = crate::nip_fi_config::NipFiCommunities::for_test_any_host(
+                TEST_COMMUNITY_URI,
+                &[TEST_ISSUER],
+            );
+            configured.nip_fi_verifier = Some(Arc::new(assertion_verifier(
+                buzz_auth::TokenClass::DedicatedNipFi,
+            )));
+            configured.nip_fi_deny_map = Some(Arc::new(buzz_auth::NipFiDenyMap::new(
+                16,
+                vec![buzz_auth::IssuerCapacity {
+                    issuer: TEST_ISSUER.into(),
+                    capacity: 16,
+                }],
+            )));
+            let redis = deadpool_redis::Config::from_url(std::env::var("REDIS_URL").unwrap())
+                .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+                .unwrap();
+            configured.admission_rate_limiter =
+                Arc::new(buzz_pubsub::rate_limiter::RedisRateLimiter::new(redis));
+            let state = Arc::new(configured);
+            let keys = nostr::Keys::generate();
+            let host = format!("callback-close-{}.example", uuid::Uuid::new_v4());
+            let created = state
+                .db
+                .create_community_with_owner_and_nip_fi_issuers(
+                    &host,
+                    &keys.public_key().to_hex(),
+                    &[TEST_ISSUER.into()],
+                    &keys,
+                )
+                .await
+                .unwrap();
+            let buzz_db::CreateCommunityWithOwnerResult::Created(row) = created.outcome else {
+                panic!("create");
+            };
+            let community = row.id.to_string();
+            let (callback_arrived, callback_release) =
+                crate::nip_fi_test_hooks::root_activation_callback_hook::arm(row.id);
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let app = build_router(state.clone())
+                .into_make_service_with_connect_info::<std::net::SocketAddr>();
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let mut request = format!("ws://{addr}/").into_client_request().unwrap();
+            request.headers_mut().insert("host", host.parse().unwrap());
+            if refusal == Some("issuer") {
+                let token = sign_assertion("nip-fi+jwt", &keys.public_key().to_hex(), None);
+                request.headers_mut().insert(
+                    "nostr-federated-identity",
+                    format!("Bearer {token}").parse().unwrap(),
+                );
+            }
+            let (mut client, _) = tokio_tungstenite::connect_async(request)
+                .await
+                .unwrap_or_else(|error| panic!("callback case {refusal:?}: {error}"));
+            tokio::time::timeout(std::time::Duration::from_secs(5), callback_arrived)
+                .await
+                .expect("root upgrade must reach activation callback")
+                .unwrap();
+            match refusal {
+                Some("generation") => state.auth_activation.require(&community, 1),
+                Some("issuer") => {
+                    state
+                        .auth_activation
+                        .require_issuer(&community, 0, "other-issuer")
+                }
+                _ => {}
+            }
+            callback_release.notify_one();
+            let received = frame(&mut client, "callback result").await;
+            if refusal.is_some() {
+                let Message::Close(Some(close)) = received else {
+                    panic!("expected policy close: {received:?}")
+                };
+                assert_eq!(u16::from(close.code), 1008);
+                assert_eq!(close.reason, "community authentication upgraded");
+            } else {
+                let Message::Text(challenge) = received else {
+                    panic!("expected challenge: {received:?}")
+                };
+                let challenge: serde_json::Value = serde_json::from_str(&challenge).unwrap();
+                assert_eq!(challenge[0], "AUTH");
+                client.close(None).await.unwrap();
+            }
+            drop(client);
+            let lines = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let lines: Vec<_> = output
+                        .lines()
+                        .into_iter()
+                        .filter(|line| line["event"] == "close" && line["community"] == community)
+                        .collect();
+                    if !lines.is_empty() {
+                        return lines;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("callback and connection ownership must retire");
+            assert_eq!(lines.len(), 1, "{refusal:?}: {lines:?}");
+            if refusal.is_some() {
+                assert_eq!(lines[0]["refused"], "auth_policy_upgraded");
+            } else {
+                assert!(lines[0]["refused"].is_null());
+            }
+            server.abort();
+            let _ = server.await;
+        }
+    }
+
     async fn authenticated_socket(
         addr: std::net::SocketAddr,
         host: &str,

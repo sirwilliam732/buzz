@@ -228,6 +228,7 @@ pub async fn ws_audio_handler(
                 shadow,
                 shadow_line,
                 connection_time,
+                client_ip,
             )
             .await;
             return;

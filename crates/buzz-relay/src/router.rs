@@ -246,7 +246,7 @@ async fn nip_fi_assertion_guard(
     if !state.auth_activation_tracking_enabled() {
         return crate::nip_fi_policy::with_policy(
             policy,
-            nip_fi_assertion_guard_with_policy(state, request, next, policy.mode),
+            nip_fi_assertion_guard_with_policy(state, slot, request, next, policy.mode),
         )
         .await;
     }
@@ -254,8 +254,9 @@ async fn nip_fi_assertion_guard(
         .auth_activation
         .enter(&policy.community_id.to_string(), policy.generation)
     else {
-        return http_denial(buzz_auth::DenialClass::AuthorizationUnavailable);
+        return nip_fi_unavailable(&slot);
     };
+    let failure_slot = slot.clone();
     // Own the admitted handler independently of the HTTP client. A dropped
     // service future must not erase accounting while a DB commit is in flight.
     match tokio::spawn(
@@ -278,7 +279,7 @@ async fn nip_fi_assertion_guard(
         Ok(response) => response,
         Err(error) => {
             tracing::error!(%error,"admitted HTTP handler failed");
-            http_denial(buzz_auth::DenialClass::AuthorizationUnavailable)
+            nip_fi_unavailable(&failure_slot)
         }
     }
 }
@@ -324,7 +325,7 @@ async fn nip_fi_assertion_guard_with_policy(
     match (verdict, community) {
         (Ok(assertion), Ok(community)) => {
             if !crate::auth_activation::enforce_current(assertion.identity().issuer()) {
-                return http_denial(buzz_auth::DenialClass::AuthorizationUnavailable);
+                return nip_fi_unavailable(&slot);
             }
             let run = crate::nip_fi_http::with_resolved_community(Ok(community), next.run(request));
             crate::nip_fi_http::with_enforce_verdict(run).await
@@ -1092,11 +1093,15 @@ async fn nip11_or_ws_handler(
             });
             limit_relay_websocket(ws, max_frame_bytes)
                 .on_upgrade(move |socket| async move {
+                    #[cfg(test)]
+                    crate::nip_fi_test_hooks::before_root_activation_callback(tenant.community())
+                        .await;
                     if !state.auth_activation_tracking_enabled() {
                         handle_connection(
                             socket,
                             state,
                             addr,
+                            client_ip,
                             tenant,
                             nip_fi_assertion,
                             shadow,
@@ -1111,11 +1116,25 @@ async fn nip11_or_ws_handler(
                         &tenant.community().as_uuid().to_string(),
                         admitted_generation,
                     ) else {
+                        let close = crate::access::CloseLine::open(
+                            uuid::Uuid::new_v4(),
+                            tenant.community(),
+                            addr,
+                            client_ip,
+                        );
+                        close.refused("auth_policy_upgraded");
                         crate::auth_activation::deny_upgraded_socket(socket).await;
                         return;
                     };
                     if let Some(assertion) = &nip_fi_assertion {
                         if !ticket.enforce_issuer(assertion.identity().issuer()) {
+                            let close = crate::access::CloseLine::open(
+                                uuid::Uuid::new_v4(),
+                                tenant.community(),
+                                addr,
+                                client_ip,
+                            );
+                            close.refused("auth_policy_upgraded");
                             crate::auth_activation::deny_upgraded_socket(socket).await;
                             return;
                         }
