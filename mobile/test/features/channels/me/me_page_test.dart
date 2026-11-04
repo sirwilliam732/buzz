@@ -9,6 +9,7 @@ import 'package:flutter/services.dart';
 import 'package:nostr/nostr.dart' as nostr;
 import 'package:buzz/shared/relay/relay.dart';
 import 'package:buzz/shared/me/me_assistants.dart';
+import 'package:buzz/shared/hosted/native_media_headers.dart';
 import 'package:buzz/shared/mentions/agent_identity_provider.dart';
 import 'package:buzz/shared/theme/buzz_icons.dart';
 import 'package:buzz/shared/widgets/frosted_app_bar.dart';
@@ -422,8 +423,17 @@ void main() {
             channelsProvider.overrideWith(FakeChannels.new),
             meAssistantsProvider.overrideWith((ref) async {
               directoryLoads++;
-              return [];
+              return [
+                const AgentDirectoryEntry(
+                  pubkey: 'agent',
+                  displayName: 'Agent',
+                  avatarUrl: 'https://relay.test/media/agent.png',
+                ),
+              ];
             }),
+            nativeMediaHeadersProvider.overrideWithValue(
+              (url) => {'Nostr-Federated-Identity': 'Bearer $url'},
+            ),
           ],
           child: MaterialApp(theme: AppTheme.light(), home: const MePage()),
         ),
@@ -452,7 +462,14 @@ void main() {
         resume ? 'same-id' : isNull,
       );
       expect(args['placeholder'], resume ? 'Chat name' : 'Message');
-      expect(args['assistants'], isEmpty);
+      expect(args['assistants'], hasLength(1));
+      // The native picker downloads avatars itself, so it needs relay headers.
+      expect(args['avatarHeaders'], {
+        'https://relay.test/media/agent.png': {
+          'Nostr-Federated-Identity':
+              'Bearer https://relay.test/media/agent.png',
+        },
+      });
       expect(args['containerCornerRadius'], Radii.container);
       expect(find.byType(BottomSheet), findsNothing);
       await tester.pumpWidget(const SizedBox.shrink());

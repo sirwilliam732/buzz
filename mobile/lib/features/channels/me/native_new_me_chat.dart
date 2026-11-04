@@ -109,6 +109,7 @@ Future<(Channel, String)?> _showNewMeChat(
               'fieldsLocked': retry,
               'error': error,
               'assistants': _nativeMeAssistants(directory ?? []),
+              'avatarHeaders': _nativeMeAvatarHeaders(ref, directory ?? []),
             });
         // Send updates only to this presentation; late results cannot populate
         // a reopened sheet or a different community's editor.
@@ -121,6 +122,7 @@ Future<(Channel, String)?> _showNewMeChat(
             ).invokeMethod<void>('updateChatAssistants', {
               'presentationId': presentationId,
               'assistants': _nativeMeAssistants(agents),
+              'avatarHeaders': _nativeMeAvatarHeaders(ref, agents),
               'defaultAssistant': _availableBestie(ref, agents),
             });
           } catch (_) {
@@ -283,6 +285,20 @@ List<Map<String, String>> _nativeMeAssistants(
       'avatarUrl': agent.avatarUrl ?? '',
     },
 ];
+
+/// Native avatar downloads bypass the hosted relay HTTP client, so relay
+/// media URLs need their Blossom and federated identity headers passed along.
+Map<String, Map<String, String>> _nativeMeAvatarHeaders(
+  WidgetRef ref,
+  List<AgentDirectoryEntry> agents,
+) {
+  final headersFor = ref.read(nativeMediaHeadersProvider);
+  return {
+    for (final agent in agents)
+      if (agent.avatarUrl case final url? when url.isNotEmpty)
+        url: headersFor(url),
+  };
+}
 
 String? _availableBestie(WidgetRef ref, List<AgentDirectoryEntry> choices) {
   final bestie = ref.read(defaultAgentProvider).value;

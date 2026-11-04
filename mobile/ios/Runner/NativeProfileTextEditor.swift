@@ -269,6 +269,9 @@ private final class NativeProfileTextEditorViewController:
   }
   // Keep decoded artwork while switching between the form and its agent list.
   private let assistantAvatars = MeAvatarLoader()
+  private var avatarHeaders: [String: [String: String]] {
+    chatOptions?["avatarHeaders"] as? [String: [String: String]] ?? [:]
+  }
   private var fieldsLocked: Bool { chatOptions?["fieldsLocked"] as? Bool ?? false }
   private var isChannelEditor: Bool { channelDescription != nil }
 
@@ -434,6 +437,8 @@ private final class NativeProfileTextEditorViewController:
     guard let token = arguments["presentationId"] as? String,
           token == chatOptions?["presentationId"] as? String else { return }
     chatOptions?["assistants"] = arguments["assistants"]
+    chatOptions?["avatarHeaders"] = arguments["avatarHeaders"]
+    assistantAvatars.headers = avatarHeaders
     chatOptions?["assistantsLoading"] = false
     chatOptions?["assistantError"] = arguments["assistantError"]
     if !assistantChosenManually && !fieldsLocked && arguments.keys.contains("defaultAssistant") {
@@ -543,6 +548,7 @@ private final class NativeProfileTextEditorViewController:
     if isChatEditor && indexPath.section == 2 {
       guard !fieldsLocked && !assistants.isEmpty else { return }
       view.endEditing(true)
+      assistantAvatars.headers = avatarHeaders
       let picker = MeAssistantListController(assistants: assistants, selected: selectedAssistant, pageColor: pageBackgroundColor, rowColor: containerBackgroundColor, avatars: assistantAvatars) { [weak self] id, avatar in
         self?.selectedAssistantAvatar = avatar
         self?.assistantChosenManually = true

@@ -18,6 +18,9 @@ final class MeAvatarLoader: NSObject, URLSessionDataDelegate, @unchecked Sendabl
   }
   private var requests: [UUID: Request] = [:]
   private var queue: [UUID] = []
+  /// Request headers by avatar URL string. Relay media needs Blossom auth and,
+  /// on hosted relays, the federated identity assertion.
+  var headers: [String: [String: String]] = [:]
 
   init(configuration: URLSessionConfiguration = .ephemeral) {
     self.configuration = configuration
@@ -71,7 +74,11 @@ final class MeAvatarLoader: NSObject, URLSessionDataDelegate, @unchecked Sendabl
         configuration.timeoutIntervalForRequest = 15
         session = URLSession(configuration: configuration, delegate: self, delegateQueue: .main)
       }
-      let task = session!.dataTask(with: request.url)
+      var urlRequest = URLRequest(url: request.url)
+      for (field, value) in headers[request.url.absoluteString] ?? [:] {
+        urlRequest.setValue(value, forHTTPHeaderField: field)
+      }
+      let task = session!.dataTask(with: urlRequest)
       requests[id]?.task = task
       task.resume()
     }
@@ -103,6 +110,16 @@ final class MeAvatarLoader: NSObject, URLSessionDataDelegate, @unchecked Sendabl
       return
     }
     completionHandler(.allow)
+  }
+
+  /// Signed requests must not carry relay credentials to a redirect target.
+  func urlSession(_ session: URLSession, task: URLSessionTask,
+                  willPerformHTTPRedirection response: HTTPURLResponse,
+                  newRequest request: URLRequest,
+                  completionHandler: @escaping (URLRequest?) -> Void) {
+    let signed = task.originalRequest?.value(forHTTPHeaderField: "Authorization") != nil
+      || task.originalRequest?.value(forHTTPHeaderField: "Nostr-Federated-Identity") != nil
+    completionHandler(signed ? nil : request)
   }
 
   func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {

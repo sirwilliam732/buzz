@@ -28,6 +28,7 @@ import '../../../shared/me/me_sync.dart';
 import '../../../shared/relay/relay.dart';
 import '../../../shared/me/me_recovery.dart';
 import '../../../shared/me/me_assistants.dart';
+import '../../../shared/hosted/native_media_headers.dart';
 import '../../../shared/theme/theme.dart';
 import '../../../shared/theme/buzz_icons.dart';
 import '../../../shared/widgets/frosted_app_bar.dart';
