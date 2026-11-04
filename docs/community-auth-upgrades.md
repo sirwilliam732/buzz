@@ -306,7 +306,7 @@ expiry, readiness removal and replacement boots do not prove completion. The
 client need not consume bytes already sent before the fence.
 
 The new tables are operator-global evidence and remain after target deletion.
-They add no triggers, functions or foreign keys. Migration 0082 is additive:
+They add no triggers, functions or foreign keys. Migration 0083 is additive:
 old relays ignore the new tables and nullable receipt columns. Desired-state
 and migrated catalogs are compared in the existing PostgreSQL parity test.
 
