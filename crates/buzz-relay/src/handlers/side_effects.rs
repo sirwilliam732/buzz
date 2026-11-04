@@ -1520,8 +1520,9 @@ async fn emit_addressable_discovery_event(
     channel_id: Uuid,
     kind: u32,
     tags: Vec<Tag>,
+    previous: Option<&buzz_core::StoredEvent>,
     relay_pubkey_hex: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     // Ensure the new event's created_at is strictly greater than any existing event
     // of the same (kind, pubkey, channel_id). Without this, rapid successive updates
     // (e.g. set topic then set purpose in the same second) can produce events with
@@ -1531,22 +1532,9 @@ async fn emit_addressable_discovery_event(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let min_ts = {
-        let existing = state
-            .db
-            .query_events_for_event_write(&buzz_db::event::EventQuery {
-                kinds: Some(vec![kind as i32]),
-                channel_id: Some(channel_id),
-                limit: Some(1),
-                ..buzz_db::event::EventQuery::for_community(tenant.community())
-            })
-            .await
-            .unwrap_or_default();
-        existing
-            .first()
-            .map(|e| e.event.created_at.as_secs() + 1)
-            .unwrap_or(now)
-    };
+    let min_ts = previous
+        .map(|stored| stored.event.created_at.as_secs() + 1)
+        .unwrap_or(now);
     let ts = now.max(min_ts);
 
     let event = EventBuilder::new(Kind::Custom(kind as u16), "")
@@ -1555,16 +1543,24 @@ async fn emit_addressable_discovery_event(
         .sign_with_keys(&state.relay_keypair)
         .map_err(|e| anyhow::anyhow!("failed to sign kind:{kind}: {e}"))?;
 
-    let (stored, was_inserted) = state
+    let replacement = state
         .db
-        .replace_addressable_event(tenant.community(), &event, Some(channel_id))
+        .replace_addressable_event_if_current(
+            tenant.community(),
+            &event,
+            Some(channel_id),
+            previous.map(|stored| stored.event.id.as_bytes().as_slice()),
+        )
         .await
         .map_err(|e| anyhow::anyhow!("channel state write failed: {}", e.kind()))?;
+    let Some((stored, was_inserted)) = replacement else {
+        return Ok(false);
+    };
     if was_inserted {
         let kind_u32 = event_kind_u32(&stored.event);
         dispatch_persistent_event(tenant, state, &stored, kind_u32, relay_pubkey_hex, None).await;
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Tags that identify the channel on every relay-signed group-state event:
@@ -1654,6 +1650,91 @@ async fn dispatch_group_members_event(
     }
 }
 
+async fn try_emit_group_metadata_and_admins(
+    tenant: &TenantContext,
+    state: &Arc<AppState>,
+    channel_id: Uuid,
+) -> anyhow::Result<bool> {
+    // Read both coordinate revisions BEFORE capturing source state. If another
+    // producer publishes after either read, its revision fences this snapshot
+    // out atomically, even when this producer resumes much later on another pod.
+    let mut previous = Vec::with_capacity(2);
+    for kind in [KIND_NIP29_GROUP_METADATA, KIND_NIP29_GROUP_ADMINS] {
+        let events = state
+            .db
+            .query_events_for_event_write(&buzz_db::event::EventQuery {
+                kinds: Some(vec![kind as i32]),
+                authors: Some(vec![state.relay_keypair.public_key().to_bytes().to_vec()]),
+                channel_id: Some(channel_id),
+                limit: Some(1),
+                ..buzz_db::event::EventQuery::for_community(tenant.community())
+            })
+            .await?;
+        previous.push(events.into_iter().next());
+    }
+    let channel = state
+        .db
+        .get_channel_for_event_write(tenant.community(), channel_id)
+        .await?;
+    let members = state
+        .db
+        .get_members_for_event_write(tenant.community(), channel_id)
+        .await?;
+
+    let relay_pubkey_hex = hex::encode(state.relay_keypair.public_key().to_bytes());
+    let group_id = channel_id.to_string();
+
+    #[cfg(test)]
+    super::discovery_ordering_postgres_tests::after_capture(channel_id).await;
+
+    {
+        let tags = buzz_db::channel::group_metadata_tags(&channel, &members)
+            .into_iter()
+            .map(Tag::parse)
+            .collect::<Result<Vec<_>, _>>()?;
+        if !emit_addressable_discovery_event(
+            tenant,
+            state,
+            channel_id,
+            KIND_NIP29_GROUP_METADATA,
+            tags,
+            previous[0].as_ref(),
+            &relay_pubkey_hex,
+        )
+        .await?
+        {
+            return Ok(false);
+        }
+    }
+
+    {
+        let mut tags: Vec<Tag> = vec![Tag::parse(["d", &group_id])?];
+        tags.extend(group_state_identity_tags(&channel.identity())?);
+        for m in members
+            .iter()
+            .filter(|m| m.role == "owner" || m.role == "admin")
+        {
+            let pubkey_hex = hex::encode(&m.pubkey);
+            tags.push(Tag::parse(["p", &pubkey_hex, &m.role])?);
+        }
+        if !emit_addressable_discovery_event(
+            tenant,
+            state,
+            channel_id,
+            KIND_NIP29_GROUP_ADMINS,
+            tags,
+            previous[1].as_ref(),
+            &relay_pubkey_hex,
+        )
+        .await?
+        {
+            return Ok(false);
+        }
+    }
+
+    Ok(true)
+}
+
 /// Emit NIP-29 group discovery events (39000, 39001, 39002) signed by the relay keypair.
 /// Called after group creation, metadata changes, or membership changes.
 /// Events are stored channel-scoped (`channel_id = Some(...)`) so that existing
@@ -1667,58 +1748,24 @@ pub async fn emit_group_discovery_events(
     state: &Arc<AppState>,
     channel_id: Uuid,
 ) -> anyhow::Result<()> {
-    let channel = state
-        .db
-        .get_channel_for_event_write(tenant.community(), channel_id)
-        .await?;
-    let members = state
-        .db
-        .get_members_for_event_write(tenant.community(), channel_id)
-        .await?;
-
-    let relay_pubkey_hex = hex::encode(state.relay_keypair.public_key().to_bytes());
-    let group_id = channel_id.to_string();
-
-    {
-        let tags = buzz_db::channel::group_metadata_tags(&channel, &members)
-            .into_iter()
-            .map(Tag::parse)
-            .collect::<Result<Vec<_>, _>>()?;
-        emit_addressable_discovery_event(
-            tenant,
-            state,
-            channel_id,
-            KIND_NIP29_GROUP_METADATA,
-            tags,
-            &relay_pubkey_hex,
-        )
-        .await?;
-    }
-
-    {
-        let mut tags: Vec<Tag> = vec![Tag::parse(["d", &group_id])?];
-        tags.extend(group_state_identity_tags(&channel.identity())?);
-        for m in members
-            .iter()
-            .filter(|m| m.role == "owner" || m.role == "admin")
-        {
-            let pubkey_hex = hex::encode(&m.pubkey);
-            tags.push(Tag::parse(["p", &pubkey_hex, &m.role])?);
+    // Conflicts mean a different producer committed after our revision read.
+    // Recapture rather than giving the old tags a later timestamp. Bound work
+    // under sustained contention and report exhaustion through the caller.
+    let mut published = false;
+    for _ in 0..8 {
+        if try_emit_group_metadata_and_admins(tenant, state, channel_id).await? {
+            published = true;
+            break;
         }
-        emit_addressable_discovery_event(
-            tenant,
-            state,
-            channel_id,
-            KIND_NIP29_GROUP_ADMINS,
-            tags,
-            &relay_pubkey_hex,
-        )
-        .await?;
     }
+    if !published {
+        anyhow::bail!("group discovery publication repeatedly changed for {channel_id}");
+    }
+    let relay_pubkey_hex = hex::encode(state.relay_keypair.public_key().to_bytes());
 
     // Re-capture membership behind the writer lock immediately before the
-    // authoritative 39002 replacement. Metadata/admin snapshots retain their
-    // existing behavior; only membership publication needs this freshness fence.
+    // authoritative 39002 replacement. Its membership lock also fences changes
+    // that have committed without a discovery publication yet.
     let relay_pubkey = state.relay_keypair.public_key().to_bytes();
     let mut member_snapshot = state
         .db

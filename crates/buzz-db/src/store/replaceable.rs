@@ -404,6 +404,38 @@ impl Db {
         event: &nostr::Event,
         channel_id: Option<Uuid>,
     ) -> Result<(StoredEvent, bool)> {
+        self.replace_addressable_event_checked(community_id, event, channel_id, None)
+            .await?
+            .ok_or_else(|| DbError::InvalidData("unconditional replacement lost its head".into()))
+    }
+
+    /// Replace only if the live coordinate still has `expected_revision`.
+    /// `None` requires an empty coordinate. Returns `None` on a changed head,
+    /// without retiring or inserting anything; callers must recapture their
+    /// source state before retrying. The check shares the replacement lock.
+    pub async fn replace_addressable_event_if_current(
+        &self,
+        community_id: CommunityId,
+        event: &nostr::Event,
+        channel_id: Option<Uuid>,
+        expected_revision: Option<&[u8]>,
+    ) -> Result<Option<(StoredEvent, bool)>> {
+        self.replace_addressable_event_checked(
+            community_id,
+            event,
+            channel_id,
+            Some(expected_revision),
+        )
+        .await
+    }
+
+    async fn replace_addressable_event_checked(
+        &self,
+        community_id: CommunityId,
+        event: &nostr::Event,
+        channel_id: Option<Uuid>,
+        expected_revision: Option<Option<&[u8]>>,
+    ) -> Result<Option<(StoredEvent, bool)>> {
         let kind_i32 = buzz_core::kind::event_kind_i32(event);
         let pubkey_bytes = event.pubkey.to_bytes();
         let created_at_secs = event.created_at.as_secs() as i64;
@@ -458,6 +490,14 @@ impl Db {
                     .fetch_optional(tx.conn())
                     .await?;
 
+                if let Some(expected) = expected_revision {
+                    let current = existing.as_ref().map(|(_, id)| id.as_slice());
+                    if current != expected {
+                        tx.rollback().await?;
+                        return Ok(None);
+                    }
+                }
+
                 // Stale-write protection: reject if incoming is not newer.
                 // NIP-16: created_at is second-resolution. On same-second tie, lowest
                 // event id (lexicographic) wins — deterministic across relays.
@@ -469,7 +509,7 @@ impl Db {
                     if dominated {
                         tx.rollback().await?;
                         let received_at = chrono::Utc::now();
-                        return Ok((
+                        return Ok(Some((
                             StoredEvent::with_received_at(
                                 event.clone(),
                                 received_at,
@@ -477,7 +517,7 @@ impl Db {
                                 false,
                             ),
                             false,
-                        ));
+                        )));
                     }
                 }
 
@@ -530,7 +570,7 @@ impl Db {
                     // ON CONFLICT fired — the event ID already exists. Rollback the
                     // soft-delete so we don't lose the previous replaceable event.
                     tx.rollback().await?;
-                    return Ok((
+                    return Ok(Some((
                         StoredEvent::with_received_at(
                             event.clone(),
                             received_at,
@@ -538,7 +578,7 @@ impl Db {
                             false,
                         ),
                         false,
-                    ));
+                    )));
                 }
 
                 crate::store::event_follow_up::after_admitted_insert(
@@ -557,10 +597,10 @@ impl Db {
 
                 tx.commit().await?;
 
-                Ok((
+                Ok(Some((
                     StoredEvent::with_received_at(event.clone(), received_at, channel_id, true),
                     true,
-                ))
+                )))
             })
             .await
     }
@@ -699,6 +739,108 @@ mod postgres_tests {
         )
         .await
         .expect("create channel");
+    }
+
+    /// An older snapshot may not acquire a later timestamp after another
+    /// producer has published. Failed preconditions leave the current event
+    /// and its mention index intact, including the initially-empty case.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn addressable_replacement_requires_the_captured_head() {
+        use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
+
+        let db = setup_db().await;
+        let community_uuid = Uuid::new_v4();
+        let channel = Uuid::new_v4();
+        let keys = Keys::generate();
+        seed_community_channel(&db.pool, community_uuid, channel, &keys).await;
+        let community = CommunityId::from_uuid(community_uuid);
+        let base = Timestamp::now().as_secs();
+        let sign = |offset, value| {
+            EventBuilder::new(Kind::Custom(39000), value)
+                .allow_self_tagging()
+                .tags([
+                    Tag::parse(["d", &channel.to_string()]).unwrap(),
+                    Tag::parse(["p", &keys.public_key().to_hex()]).unwrap(),
+                ])
+                .custom_created_at(Timestamp::from(base + offset))
+                .sign_with_keys(&keys)
+                .unwrap()
+        };
+        let original = sign(0, "original");
+        assert!(
+            db.replace_addressable_event_if_current(community, &original, Some(channel), None)
+                .await
+                .unwrap()
+                .unwrap()
+                .1
+        );
+        let newer = sign(1, "newer");
+        assert!(
+            db.replace_addressable_event_if_current(community, &newer, Some(channel), None)
+                .await
+                .unwrap()
+                .is_none(),
+            "empty-coordinate precondition must reject an existing head"
+        );
+        assert!(
+            db.replace_addressable_event_if_current(
+                community,
+                &newer,
+                Some(channel),
+                Some(original.id.as_bytes().as_slice())
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .1
+        );
+        let stale = sign(2, "stale snapshot with a later timestamp");
+        assert!(db
+            .replace_addressable_event_if_current(
+                community,
+                &stale,
+                Some(channel),
+                Some(original.id.as_bytes().as_slice())
+            )
+            .await
+            .unwrap()
+            .is_none());
+        // Matching the head does not bypass normal NIP-16 stale-write rules.
+        assert!(
+            !db.replace_addressable_event_if_current(
+                community,
+                &original,
+                Some(channel),
+                Some(newer.id.as_bytes().as_slice())
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .1
+        );
+        let events = db
+            .query_events(&event::EventQuery {
+                kinds: Some(vec![39000]),
+                channel_id: Some(channel),
+                ..event::EventQuery::for_community(community)
+            })
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event.id, newer.id);
+        let mentions: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM event_mentions WHERE community_id = $1 AND event_id = $2",
+        )
+        .bind(community.as_uuid())
+        .bind(newer.id.as_bytes().as_slice())
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            mentions, 1,
+            "failed replacement must retain the current mention index"
+        );
     }
 
     #[tokio::test]
